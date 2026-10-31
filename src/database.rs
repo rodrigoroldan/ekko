@@ -59,6 +59,18 @@ CREATE TABLE lengths (item INTEGER PRIMARY KEY, words INTEGER NOT NULL, place TE
 CREATE INDEX lengths_place ON lengths(place);
 ";
 
+/// The items the guard's index may draw from: those holding a cue, or a
+/// question's allowance. Its own partial index has the same condition,
+/// which is what lets SQLite read the index for it.
+const GUARDED: &str = "json_extract(body, '$.cue') IS NOT NULL OR json_extract(body, '$.question.allow') IS NOT NULL";
+
+/// Lays out what layout 2 adds: `DERIVED`, and the guard's partial index.
+fn lay_derived(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(DERIVED)?;
+    conn.execute_batch(&format!("CREATE INDEX items_guarded ON items(id) WHERE {GUARDED};"))?;
+    Ok(())
+}
+
 /// The rows `Database::working_set` reads, given its targets' ids as a JSON
 /// array: the blockedBy group, however far, then two steps of every
 /// reference, each way.
@@ -154,7 +166,7 @@ fn derive(conn: &Connection, id: u32, body: Option<&str>) -> Result<(), StorageE
 /// Brings a database of layout 1 to this one, in the caller's transaction:
 /// the derived tables, built from every item.
 fn upgrade(conn: &Connection) -> Result<(), StorageError> {
-    conn.execute_batch(DERIVED)?;
+    lay_derived(conn)?;
     let rows: Vec<(u32, String)> = {
         let mut statement = conn.prepare("SELECT id, body FROM items ORDER BY id")?;
         let found = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -254,7 +266,7 @@ impl Database {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.execute_batch(SCHEMA)?;
-        conn.execute_batch(DERIVED)?;
+        lay_derived(&conn)?;
         conn.pragma_update(None, "user_version", LAYOUT)?;
         Database::configured(conn)
     }
@@ -385,6 +397,20 @@ impl Database {
         tx.finish()?;
         let counted = found.into_iter().map(|(item, (length, counts))| (item, length, counts)).collect();
         Ok(SearchCounts { documents: documents as usize, total: total as usize, counted })
+    }
+
+    /// The items holding a cue or a question's allowance, by the partial
+    /// index on them: all the guard's index can be made of.
+    pub fn guarded(&self) -> Result<ItemMap, StorageError> {
+        let mut rows = Vec::new();
+        {
+            let mut statement = self.conn.prepare_cached(&format!("SELECT id, body FROM items WHERE {GUARDED} ORDER BY id"))?;
+            let mut found = statement.query([])?;
+            while let Some(row) = found.next()? {
+                rows.push((row.get::<_, u32>(0)?, row.get::<_, String>(1)?));
+            }
+        }
+        parse(rows)
     }
 
     /// The items whose revision is past `since` and no later than `cursor`,

@@ -191,13 +191,19 @@ fn current(home: &Path, now: i64) -> Index {
 }
 
 fn build(boards: &[Board], stamps: Vec<(PathBuf, Stamp)>, now: i64) -> Index {
+    build_from(boards, stamps, now, |storage| storage.guarded(false))
+}
+
+/// `build`, each board's items read by `read`: those a cue or an allowance
+/// may be among, from its database (task 2234), or a whole board.
+fn build_from(boards: &[Board], stamps: Vec<(PathBuf, Stamp)>, now: i64, read: impl Fn(&Storage) -> Result<std::sync::Arc<crate::storage::ItemMap>, crate::storage::StorageError>) -> Index {
     let mut index = Index { stamps, ..Index::default() };
     for board in boards {
         // Only a board already there: opening one creates its folders.
         if !storage_file(&board.dir).is_file() {
             continue;
         }
-        let Ok(data) = Storage::new(&board.dir).and_then(|storage| storage.get_shared()) else { continue };
+        let Ok(data) = Storage::new(&board.dir).and_then(|storage| read(&storage)) else { continue };
         for item in data.values() {
             if let (true, Some(cue)) = (on(item), &item.cue) {
                 let guards = cue.cue.folder.as_deref().map(PathBuf::from).or_else(|| board.folder.clone());
@@ -891,6 +897,33 @@ mod tests {
         data.get_mut(&id).unwrap().cue = Some(CueOn { cue, question: "q".into(), at: 0 });
         ekko.storage.set(&data).unwrap();
         id
+    }
+
+    /// The guard's index made from the items a board's database names for
+    /// it (task 2234) is the index made from the whole board: the cue that
+    /// is on, and not those trashed or stashed; and the database names only
+    /// the items holding a cue.
+    #[test]
+    fn the_index_from_the_guarded_items_is_the_one_from_the_whole_board() {
+        let home = home("guarded");
+        let dir = home.join(".ekko");
+        let on = cued(&dir, "never force-push", cue("git", &["push", "--force"], None));
+        let trashed = cued(&dir, "never rm -rf", cue("rm", &["-rf"], None));
+        let stashed = cued(&dir, "never pipe curl to sh", cue("curl", &["sh"], None));
+        let ekko = ekko_at(&dir, None);
+        apply(&ekko, json!({"op": "create", "text": "a task with no cue"})).unwrap();
+        ekko.set_trashed(&[trashed.to_string()], true).unwrap();
+        ekko.set_stashed(&[stashed.to_string()], true).unwrap();
+
+        let boards = [Board { dir: dir.clone(), folder: None }];
+        let whole = build_from(&boards, Vec::new(), 0, |storage| storage.get_shared());
+        let guarded = build_from(&boards, Vec::new(), 0, |storage| storage.guarded(true));
+        assert_eq!(whole.cues.iter().map(|cue| cue.id).collect::<Vec<_>>(), vec![on], "{whole:?}");
+        assert_eq!(serde_json::to_string(&guarded).unwrap(), serde_json::to_string(&whole).unwrap());
+        let read = Storage::new(&dir).unwrap().guarded(true).unwrap();
+        assert_eq!(read.keys().copied().collect::<Vec<_>>(), vec![on, trashed, stashed], "the database named more than the cued");
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     fn event(command: &str, cwd: &Path, tool_use_id: &str) -> String {

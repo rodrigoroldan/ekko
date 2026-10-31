@@ -368,6 +368,17 @@ impl Storage {
         Ok(Some(read(&open.db)?))
     }
 
+    /// The items the guard's index may draw from: from the board's database
+    /// those holding a cue or an allowance (task 2234), else -- before the
+    /// board has a database of this layout, or while this process keeps it
+    /// whole and `even_if_kept` is not asked -- the whole board.
+    pub fn guarded(&self, even_if_kept: bool) -> Result<Arc<ItemMap>, StorageError> {
+        match self.by_query(even_if_kept, Database::guarded)? {
+            Some(items) => Ok(Arc::new(items)),
+            None => self.get_shared(),
+        }
+    }
+
     /// `working_set` from the database alone, whatever this process keeps:
     /// for the tests that hold its answers to the whole board's.
     #[cfg(test)]
@@ -2222,12 +2233,13 @@ mod tests {
     /// Every public method of `Storage` that only reads, and every one that
     /// writes the board's folder: the writes are what a refused storage
     /// refuses (task 1576).
-    const READS: [&str; 18] = [
+    const READS: [&str; 19] = [
         "get",
         "working_set",
         "working_set_of",
         "working_set_read",
         "by_query",
+        "guarded",
         "get_shared",
         "get_archive",
         "storage_path",
