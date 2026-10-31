@@ -149,8 +149,7 @@ pub(crate) fn told_dir(home: &Path) -> PathBuf {
 /// served it. Best effort.
 fn forget_ended(home: &Path) {
     let Ok(entries) = fs::read_dir(told_dir(home)) else { return };
-    let boot: Option<String> =
-        fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|boot| boot.chars().filter(char::is_ascii_alphanumeric).take(8).collect());
+    let boot: Option<String> = crate::holder::boot().map(|boot| boot.chars().filter(char::is_ascii_alphanumeric).take(8).collect());
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let mut parts = name.splitn(3, '-');
