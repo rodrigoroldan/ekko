@@ -776,9 +776,13 @@ mod tests {
                 json!({"op": "create", "text": "thrown away"}),
             ],
         );
+        // Trashed at the clock's time, not NOW: the trash empties what is 30
+        // days old by the real clock, and from 2026-10-21 on, an item trashed
+        // at NOW was already gone (task 2266).
+        let trashed = chrono::Local::now().timestamp_millis();
         write(&here, |data| {
             for id in [3, 4] {
-                data.get_mut(&id).unwrap().trashed = Some(NOW);
+                data.get_mut(&id).unwrap().trashed = Some(trashed);
             }
         });
         let refused = |ids: &[&str]| match home.move_to(&here, "notes", ids) {
@@ -790,7 +794,7 @@ mod tests {
 
         let moved = home.move_to(&here, "notes", &["1"]).unwrap();
         assert_eq!(moved.iter().map(|item| (item.id, item.note_of)).collect::<Vec<_>>(), [(1, None), (2, Some(1)), (3, Some(1))]);
-        assert_eq!(board(&there)[&3].trashed, Some(NOW), "still in the trash, with the time it has left");
+        assert_eq!(board(&there)[&3].trashed, Some(trashed), "still in the trash, with the time it has left");
     }
 
     /// A phase goes only where it is declared.
