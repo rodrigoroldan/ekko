@@ -350,6 +350,24 @@ impl Storage {
         Ok(Some((Arc::new(board), revision)))
     }
 
+    /// `read` on the board's database, where it is of this layout and this
+    /// process keeps no whole board of its version -- which answers at no
+    /// more cost, as it did before the database (task 2234) -- or even then
+    /// when `even_if_kept`, for the tests that hold one way to the other.
+    /// `None` where it is not read, for the caller to read the whole board.
+    pub fn by_query<T>(&self, even_if_kept: bool, read: impl FnOnce(&Database) -> Result<T, StorageError>) -> Result<Option<T>, StorageError> {
+        let mut opened = self.database.lock().unwrap_or_else(PoisonError::into_inner);
+        self.open_database(&mut opened)?;
+        let Some(open) = opened.as_ref() else { return Ok(None) };
+        if open.db.layout()? != database::LAYOUT {
+            return Ok(None);
+        }
+        if !even_if_kept && kept_board(&self.database_file, Version::of_database(open.file, open.db.writes()?)).is_some() {
+            return Ok(None);
+        }
+        Ok(Some(read(&open.db)?))
+    }
+
     /// `working_set` from the database alone, whatever this process keeps:
     /// for the tests that hold its answers to the whole board's.
     #[cfg(test)]
@@ -2204,11 +2222,12 @@ mod tests {
     /// Every public method of `Storage` that only reads, and every one that
     /// writes the board's folder: the writes are what a refused storage
     /// refuses (task 1576).
-    const READS: [&str; 17] = [
+    const READS: [&str; 18] = [
         "get",
         "working_set",
         "working_set_of",
         "working_set_read",
+        "by_query",
         "get_shared",
         "get_archive",
         "storage_path",
@@ -2290,6 +2309,8 @@ mod tests {
             .take_while(|line| *line != "mod tests {")
             .filter_map(|line| line.trim_start().strip_prefix("pub fn "))
             .filter_map(|rest| rest.split_once("(&self").map(|(name, _)| name))
+            // A generic method by its name alone: by_query<T> is by_query.
+            .map(|name| name.split_once('<').map_or(name, |(name, _)| name))
             .collect();
         let mut known: Vec<&str> = READS.iter().chain(&WRITES).copied().collect();
         found.sort_unstable();

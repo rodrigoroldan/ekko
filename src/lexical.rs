@@ -63,6 +63,12 @@ impl Query {
     }
 
     /// The query word a folded word of the text matches, if any.
+    /// Each term, with whether it matches only itself rather than every
+    /// word it starts: what a search by the board's database asks for.
+    pub fn terms(&self) -> Vec<(&str, bool)> {
+        self.terms.iter().map(String::as_str).zip(self.whole.iter().copied()).collect()
+    }
+
     fn term_of(&self, word: &str) -> Option<usize> {
         (0..self.terms.len()).find(|&at| self.matches(at, word))
     }
@@ -118,20 +124,30 @@ pub struct Ranked {
 
 /// Ranks `texts` against `query` by the rules the module describes.
 pub fn rank(query: &Query, texts: &[&str]) -> Ranked {
-    let terms = query.terms.len();
     let mut word = String::new();
     let counted: Vec<(usize, Vec<usize>)> = texts.iter().map(|text| count(query, text, &mut word)).collect();
+    let total = counted.iter().map(|(length, _)| *length).sum::<usize>();
+    let counted = counted.into_iter().enumerate().map(|(index, (length, counts))| (index, length, counts)).collect();
+    rank_counted(query.terms.len(), texts.len(), total, counted)
+}
 
-    let documents = texts.len() as f64;
-    let average = (counted.iter().map(|(length, _)| *length).sum::<usize>() as f64 / documents.max(1.0)).max(1.0);
+/// `rank`, from what it counts in the texts: how many there are
+/// (`documents`), how many words they hold in all (`total`), and for each
+/// text, as (index, length, count per term), how often it holds each of the
+/// query's `terms`. A text holding none counts only in `documents` and
+/// `total`, so `counted` may leave it out, as a search by the board's
+/// database does (task 2234); the index is what a hit names, and orders
+/// hits of the same score.
+pub fn rank_counted(terms: usize, documents: usize, total: usize, counted: Vec<(usize, usize, Vec<usize>)>) -> Ranked {
+    let documents = documents as f64;
+    let average = (total as f64 / documents.max(1.0)).max(1.0);
     let containing: Vec<f64> =
-        (0..terms).map(|at| counted.iter().filter(|(_, counts)| counts[at] > 0).count() as f64).collect();
-    let every_word = counted.iter().any(|(_, counts)| counts.iter().all(|&count| count > 0));
+        (0..terms).map(|at| counted.iter().filter(|(_, _, counts)| counts[at] > 0).count() as f64).collect();
+    let every_word = counted.iter().any(|(_, _, counts)| counts.iter().all(|&count| count > 0));
 
     let mut hits: Vec<Hit> = counted
         .iter()
-        .enumerate()
-        .filter_map(|(index, (length, counts))| {
+        .filter_map(|(index, length, counts)| {
             let matched = counts.iter().filter(|&&count| count > 0).count();
             if matched == 0 || (every_word && matched < terms) {
                 return None;
@@ -146,7 +162,7 @@ pub fn rank(query: &Query, texts: &[&str]) -> Ranked {
                     idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * *length as f64 / average))
                 })
                 .sum();
-            Some(Hit { index, matched, score })
+            Some(Hit { index: *index, matched, score })
         })
         .collect();
     hits.sort_by(|a, b| b.matched.cmp(&a.matched).then(b.score.total_cmp(&a.score)).then(a.index.cmp(&b.index)));

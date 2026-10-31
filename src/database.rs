@@ -55,7 +55,8 @@ CREATE INDEX refs_target ON refs(target);
 CREATE INDEX refs_item ON refs(item);
 CREATE TABLE words (word TEXT NOT NULL, item INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (word, item)) WITHOUT ROWID;
 CREATE INDEX words_item ON words(item);
-CREATE TABLE lengths (item INTEGER PRIMARY KEY, words INTEGER NOT NULL);
+CREATE TABLE lengths (item INTEGER PRIMARY KEY, words INTEGER NOT NULL, place TEXT);
+CREATE INDEX lengths_place ON lengths(place);
 ";
 
 /// The rows `Database::working_set` reads, given its targets' ids as a JSON
@@ -118,6 +119,19 @@ pub fn references(item: &Value) -> Vec<(String, String)> {
     found
 }
 
+/// Where a search finds `item`, as agent.rs's `passing` sorts the board:
+/// "board" for one on some board and neither stashed nor trashed, "stash"
+/// for one stashed, on some board and not trashed, nothing otherwise.
+fn place(item: &Value) -> Option<&'static str> {
+    let set = |field: &str| item.get(field).is_some_and(|value| !value.is_null());
+    let on_board = item["boards"].as_array().is_some_and(|boards| !boards.is_empty());
+    match (on_board, set("trashed"), set("stashed")) {
+        (true, false, false) => Some("board"),
+        (true, false, true) => Some("stash"),
+        _ => None,
+    }
+}
+
 /// Puts in the derived tables what `body`, item `id`'s JSON, holds, after
 /// taking out what they held of it; `None` leaves the item out of them.
 fn derive(conn: &Connection, id: u32, body: Option<&str>) -> Result<(), StorageError> {
@@ -133,7 +147,7 @@ fn derive(conn: &Connection, id: u32, body: Option<&str>) -> Result<(), StorageE
     for (word, n) in counts {
         conn.prepare_cached("INSERT INTO words (word, item, n) VALUES (?1, ?2, ?3)")?.execute(params![word, id, n as i64])?;
     }
-    conn.prepare_cached("INSERT INTO lengths (item, words) VALUES (?1, ?2)")?.execute(params![id, length as i64])?;
+    conn.prepare_cached("INSERT INTO lengths (item, words, place) VALUES (?1, ?2, ?3)")?.execute(params![id, length as i64, place(&item)])?;
     Ok(())
 }
 
@@ -195,6 +209,15 @@ pub struct Written {
 
 pub struct Database {
     conn: Connection,
+}
+
+/// What `Database::search_counts` reads for a search: the candidates' count
+/// and their words in all, and each one holding a query word, as (id,
+/// length, count per term).
+pub struct SearchCounts {
+    pub documents: usize,
+    pub total: usize,
+    pub counted: Vec<(u32, usize, Vec<usize>)>,
 }
 
 impl Database {
@@ -333,6 +356,35 @@ impl Database {
         let revision: Option<i64> = tx.query_row("SELECT max(rev) FROM items", [], |row| row.get(0))?;
         tx.finish()?;
         Ok((parse(rows)?, revision.unwrap_or(0) as u64))
+    }
+
+    /// What a search ranks the items in `place` by (see `place`), read in
+    /// one snapshot: how many they are, how many words they hold in all, and
+    /// each one holding a query word, in id order, with its length and how
+    /// often it holds each of `terms`. A term matches the words it starts,
+    /// or with `whole` only itself, as `lexical::Query` matches them.
+    pub fn search_counts(&self, place: &str, terms: &[(&str, bool)]) -> Result<SearchCounts, StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let (documents, total): (i64, i64) =
+            tx.query_row("SELECT count(*), coalesce(sum(words), 0) FROM lengths WHERE place = ?1", [place], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut found: std::collections::BTreeMap<u32, (usize, Vec<usize>)> = std::collections::BTreeMap::new();
+        for (at, (term, whole)) in terms.iter().enumerate() {
+            // Words hold only letters and digits, so none goes on past a
+            // term with U+10FFFF: the range is every word the term starts.
+            let end = if *whole { format!("{term}\0") } else { format!("{term}\u{10FFFF}") };
+            let mut statement = tx.prepare_cached(
+                "SELECT w.item, l.words, sum(w.n) FROM words w JOIN lengths l ON l.item = w.item \
+                 WHERE w.word >= ?1 AND w.word < ?2 AND l.place = ?3 GROUP BY w.item",
+            )?;
+            let mut rows = statement.query(params![term, end, place])?;
+            while let Some(row) = rows.next()? {
+                let (item, length, n): (u32, i64, i64) = (row.get(0)?, row.get(1)?, row.get(2)?);
+                found.entry(item).or_insert_with(|| (length as usize, vec![0; terms.len()])).1[at] = n as usize;
+            }
+        }
+        tx.finish()?;
+        let counted = found.into_iter().map(|(item, (length, counts))| (item, length, counts)).collect();
+        Ok(SearchCounts { documents: documents as usize, total: total as usize, counted })
     }
 
     /// The items whose revision is past `since` and no later than `cursor`,
@@ -721,7 +773,7 @@ mod tests {
         for query in [
             "SELECT 'ref ' || item || ' ' || path || ' ' || target FROM refs ORDER BY 1",
             "SELECT 'word ' || word || ' ' || item || ' ' || n FROM words ORDER BY 1",
-            "SELECT 'length ' || item || ' ' || words FROM lengths ORDER BY 1",
+            "SELECT 'length ' || item || ' ' || words || ' ' || coalesce(place, '-') FROM lengths ORDER BY 1",
         ] {
             let mut statement = conn.prepare(query).unwrap();
             rows.extend(statement.query_map([], |row| row.get::<_, String>(0)).unwrap().map(Result::unwrap));

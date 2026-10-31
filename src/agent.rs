@@ -1999,6 +1999,9 @@ pub struct Found {
 /// without it, what matches there as well as the hits is counted.
 pub fn search(ekko: &Ekko, text: Option<&str>, filters: &[String], limit: usize) -> Result<Found, EkkoError> {
     let query = Query::new(text.unwrap_or_default());
+    if let Some(found) = search_by_query(ekko, &query, filters, limit, false)? {
+        return Ok(found);
+    }
     let all = ekko.storage.get_shared()?;
     if query.is_empty() && filters.is_empty() {
         return Ok(Found { summary: Some(summary(&all)), ..Found::default() });
@@ -2043,6 +2046,55 @@ pub fn search(ekko: &Ekko, text: Option<&str>, filters: &[String], limit: usize)
         stashed: if ranked.every_word && !in_stash.every_word { 0 } else { in_stash.hits.len() },
         stashed_every_word: in_stash.every_word,
     })
+}
+
+/// `search` for a text with no filter but the stash's, from the board's
+/// database (task 2234): its words and lengths rank the candidates as
+/// `lexical::rank` ranks their texts, and only the hits shown, with what
+/// their entries draw on, are parsed. `None` where the database is not
+/// read -- a board without one of this layout, or whose whole board this
+/// process keeps, unless `even_if_kept` -- or for any other search.
+fn search_by_query(ekko: &Ekko, query: &Query, filters: &[String], limit: usize, even_if_kept: bool) -> Result<Option<Found>, EkkoError> {
+    let stash_only = match filters {
+        [] => false,
+        [only] if only == STASHED => true,
+        _ => return Ok(None),
+    };
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let terms = query.terms();
+    let rank = |counts: crate::database::SearchCounts| {
+        let counted = counts.counted.into_iter().map(|(id, length, n)| (id as usize, length, n)).collect();
+        lexical::rank_counted(terms.len(), counts.documents, counts.total, counted)
+    };
+    let read = ekko.storage.by_query(even_if_kept, |db| {
+        let ranked = rank(db.search_counts(if stash_only { "stash" } else { "board" }, &terms)?);
+        // A search of the stash itself counts nothing more there.
+        let in_stash = if stash_only { lexical::rank_counted(terms.len(), 0, 0, Vec::new()) } else { rank(db.search_counts("stash", &terms)?) };
+        let shown: Vec<String> = ranked.hits.iter().take(limit).map(|hit| hit.index.to_string()).collect();
+        let (board, _) = db.working_set(&shown)?;
+        Ok((ranked, in_stash, board))
+    })?;
+    let Some((ranked, in_stash, board)) = read else { return Ok(None) };
+    let board = Arc::new(board);
+    let phases = ekko.storage.get_phases()?;
+    let reader = Reader::shared(&board, &phases).seen_by(ekko);
+    let hits = ranked
+        .hits
+        .iter()
+        .take(limit)
+        .filter_map(|hit| board.get(&(hit.index as u32)))
+        .map(|item| (reader.entry(item), lexical::snippet(&item.description, query, SNIPPET)))
+        .collect();
+    Ok(Some(Found {
+        total: ranked.hits.len(),
+        every_word: ranked.every_word,
+        hits,
+        summary: None,
+        stashed: if ranked.every_word && !in_stash.every_word { 0 } else { in_stash.hits.len() },
+        stashed_every_word: in_stash.every_word,
+    }))
 }
 
 /// The items `--list` gives for `filters`, each once however many boards it
@@ -5385,6 +5437,62 @@ mod tests {
         assert!(current.contains("\nReplaces, an earlier handoff\n   2. [handoff, replaced] stopped"), "{current}");
         let found = search(&ekko, Some("parser"), &[], 20).unwrap().text();
         assert!(found.contains("   2. [handoff, replaced by 3] "), "{found}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A search from the board's database (task 2234) answers what the search
+    /// over the whole board answers -- the hits, their order and entries, the
+    /// totals and the stash's count -- for short words and long, several at
+    /// once, accents, prefixes, plurals, a word no item holds, and the stash's
+    /// filter; another filter it leaves to the whole board.
+    #[test]
+    fn a_search_by_query_answers_as_the_whole_board_does() {
+        let (ekko, dir) = board("search-by-query");
+        write(
+            &ekko,
+            &[
+                serde_json::json!({"op": "create", "text": "Parser reads tabs and spaces"}),
+                serde_json::json!({"op": "create", "text": "The lexer feeds the parser", "blocked_by": ["$1"]}),
+                serde_json::json!({"op": "create", "text": "Ação de migração do índice"}),
+                serde_json::json!({"op": "create", "kind": "note", "text": "parsing notes on the lexer", "attached_to": "$1"}),
+                serde_json::json!({"op": "create", "text": "Release notes for the parser"}),
+                serde_json::json!({"op": "create", "text": "Parsers everywhere: parser, parser"}),
+                serde_json::json!({"op": "create", "text": "go to the store"}),
+                serde_json::json!({"op": "create", "text": "notes thrown away, parser and all"}),
+                serde_json::json!({"op": "create", "text": "an unrelated chore"}),
+            ],
+        );
+        ekko.set_stashed(&words(&["5"]), true).unwrap();
+        ekko.set_trashed(&words(&["8"]), true).unwrap();
+        // Kept, as a process that read it keeps it: the plain search below
+        // then reads the whole board, as it did before the database.
+        ekko.storage.get_shared().unwrap();
+        assert!(search_by_query(&ekko, &Query::new("parser"), &[], 3, false).unwrap().is_none(), "a kept board was not read whole");
+
+        let stash = vec![STASHED.to_string()];
+        let asked: [(&str, &[String]); 11] = [
+            ("parser", &[]),
+            ("pars", &[]),
+            ("parser lexer", &[]),
+            ("acao indice", &[]),
+            ("go", &[]),
+            ("to the store", &[]),
+            ("notes", &[]),
+            ("notes", &stash),
+            ("parser zebra", &[]),
+            ("zebra", &[]),
+            ("parsers feeding", &[]),
+        ];
+        for (text, filters) in asked {
+            for limit in [1, 3, 20] {
+                let whole = search(&ekko, Some(text), filters, limit).unwrap();
+                let by_query = search_by_query(&ekko, &Query::new(text), filters, limit, true).unwrap().expect("read from the database");
+                assert_eq!(format!("{by_query:?}"), format!("{whole:?}"), "{text:?} {filters:?} {limit}");
+                assert_eq!(by_query.text(), whole.text(), "{text:?} {filters:?} {limit}");
+            }
+        }
+        assert!(search_by_query(&ekko, &Query::new("parser"), &["pending".to_string()], 3, true).unwrap().is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
