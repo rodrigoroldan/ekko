@@ -49,6 +49,7 @@ const DERIVED: &str = "
 ALTER TABLE items ADD COLUMN uid TEXT GENERATED ALWAYS AS (json_extract(body, '$.uid')) VIRTUAL;
 ALTER TABLE items ADD COLUMN rev INTEGER GENERATED ALWAYS AS (json_extract(body, '$.rev')) VIRTUAL;
 CREATE INDEX items_uid ON items(uid);
+CREATE INDEX items_id_uid ON items(id, uid);
 CREATE INDEX items_rev ON items(rev);
 CREATE TABLE refs (item INTEGER NOT NULL, path TEXT NOT NULL, target TEXT NOT NULL);
 CREATE INDEX refs_target ON refs(target, path, item);
@@ -69,6 +70,14 @@ const GUARDED: &str = "json_extract(body, '$.cue') IS NOT NULL OR json_extract(b
 /// (`wake::untold`).
 const HELD: &str = "json_extract(body, '$.heldBy') IS NOT NULL";
 
+/// The notes `wake::untold` may tell a session of, by what it tells: the
+/// user's feedback from an artifact's page (a comment or a review), a wait,
+/// and a question. The fourth kind, a note on a task someone holds, is a
+/// step back from the items holding a holder (`HELD`), which untold reads
+/// with them.
+const TELLABLE: &str = "json_extract(body, '$.comment') IS NOT NULL OR json_extract(body, '$.review') IS NOT NULL \
+     OR json_extract(body, '$.wait') IS NOT NULL OR json_extract(body, '$.question') IS NOT NULL";
+
 /// An item whose uid has not the shape `is_uid` reads, in SQL: references
 /// to it are not in refs, so a read by query could miss them. A board
 /// written by hand or grown by a script may hold one; ekko makes none.
@@ -88,7 +97,10 @@ fn lay_derived(conn: &Connection) -> Result<(), StorageError> {
 
 /// The rows `Database::working_set` reads, given its targets' ids as a JSON
 /// array: the blockedBy group, however far, then two steps of every
-/// reference, each way.
+/// reference, each way. A step back from an item reads its uid from
+/// items_id_uid, by INDEXED BY: through the table, SQLite would take the
+/// uid out of each item's JSON (4.1 ms against 2.5 ms for 281 items of
+/// graff's board, measured).
 const WORKING_SET: &str = "
 WITH RECURSIVE
   asked(id) AS (SELECT value FROM json_each(?1)),
@@ -97,17 +109,17 @@ WITH RECURSIVE
     UNION
     SELECT b.id FROM grp JOIN refs r ON r.item = grp.id AND r.path = 'blockedBy' JOIN items b ON b.uid = r.target
     UNION
-    SELECT r.item FROM grp JOIN items g ON g.id = grp.id JOIN refs r ON r.target = g.uid AND r.path = 'blockedBy'
+    SELECT r.item FROM grp JOIN items g INDEXED BY items_id_uid ON g.id = grp.id JOIN refs r ON r.target = g.uid AND r.path = 'blockedBy'
   ),
   one(id) AS (
     SELECT id FROM grp
     UNION SELECT t.id FROM grp JOIN refs r ON r.item = grp.id JOIN items t ON t.uid = r.target
-    UNION SELECT r.item FROM grp JOIN items g ON g.id = grp.id JOIN refs r ON r.target = g.uid
+    UNION SELECT r.item FROM grp JOIN items g INDEXED BY items_id_uid ON g.id = grp.id JOIN refs r ON r.target = g.uid
   ),
   two(id) AS (
     SELECT id FROM one
     UNION SELECT t.id FROM one JOIN refs r ON r.item = one.id JOIN items t ON t.uid = r.target
-    UNION SELECT r.item FROM one JOIN items g ON g.id = one.id JOIN refs r ON r.target = g.uid
+    UNION SELECT r.item FROM one JOIN items g INDEXED BY items_id_uid ON g.id = one.id JOIN refs r ON r.target = g.uid
   )
 SELECT id, body FROM items WHERE id IN (SELECT id FROM two) ORDER BY id
 ";
@@ -444,6 +456,14 @@ impl Database {
     pub fn held(&self) -> Result<Vec<u32>, StorageError> {
         let mut statement = self.conn.prepare_cached(&format!("SELECT id FROM items INDEXED BY items_held WHERE {HELD} ORDER BY id"))?;
         let ids = statement.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    /// The items whose revision is past `since` that `wake::untold` may
+    /// tell of (`TELLABLE`), by the index on rev.
+    pub fn tellable(&self, since: i64) -> Result<Vec<u32>, StorageError> {
+        let mut statement = self.conn.prepare_cached(&format!("SELECT id FROM items WHERE rev > ?1 AND ({TELLABLE}) ORDER BY id"))?;
+        let ids = statement.query_map([since], |row| row.get(0))?.collect::<Result<_, _>>()?;
         Ok(ids)
     }
 

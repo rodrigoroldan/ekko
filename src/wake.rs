@@ -177,23 +177,24 @@ pub fn untold(ekko: &Ekko, me: &Actor, told: &Told, since: u64, holding: bool) -
 
 /// What `untold` reads (task 2234). Every line it tells is about a note a
 /// write moved past `since` -- feedback sent, a wait ended or kept, a
-/// question answered, a note written: the write that does it stamps the
-/// note with its revision -- and what the line draws on besides is within
-/// two references of that note, as `Database::working_set` reads them, but
-/// for the tasks its writer's process holds, which the items holding a
-/// holder add. So: those items, read alone; the whole board where this
-/// process keeps it, where more than an eighth of the board moved past
-/// `since`, or where the board has no database of this layout. `forced`
-/// reads them alone whatever this process keeps and however many moved:
-/// for the tests that hold one read to the other.
+/// question answered, a note written on a task someone holds: the write
+/// that does it stamps the note with its revision -- and what the line
+/// draws on besides is within two references of that note, as
+/// `Database::working_set` reads them, but for the tasks its writer's
+/// process holds. So: the notes of the kinds told (`Database::tellable`)
+/// and the items holding a holder -- whose working sets hold every note on
+/// a held task, and the writers' tasks -- read alone; the whole board where this process keeps it,
+/// where more than an eighth of the board moved past `since`, or where the
+/// board has no database of this layout. `forced` reads them alone
+/// whatever this process keeps and however many moved: for the tests that
+/// hold one read to the other.
 fn read(ekko: &Ekko, since: u64, forced: bool) -> Result<std::sync::Arc<crate::storage::ItemMap>, EkkoError> {
     let since = i64::try_from(since).unwrap_or(i64::MAX);
     let read = ekko.storage.working_set_of(forced, |db| {
-        let moved = db.moved_between(since, i64::MAX)?;
-        if !forced && moved.len() * 8 > db.items()? {
+        if !forced && db.moved_between(since, i64::MAX)?.len() * 8 > db.items()? {
             return Ok(None);
         }
-        Ok(Some(moved.into_iter().chain(db.held()?).map(|id| id.to_string()).collect()))
+        Ok(Some(db.tellable(since)?.into_iter().chain(db.held()?).map(|id| id.to_string()).collect()))
     })?;
     match read {
         Some((all, _)) => Ok(all),
@@ -619,7 +620,7 @@ mod tests {
     /// wait another session keeps on a task this one holds, the answer to a
     /// question its ask left open, and notes written on a task it holds --
     /// one by a session named by the tasks it holds, one of which no
-    /// reference from the note reaches.
+    /// reference from the note reaches -- and a wait on a task nobody holds.
     #[test]
     fn untold_from_its_read_is_untold_from_the_whole_board() {
         let (me, other, _) = crate::holder::test_sessions();
@@ -627,7 +628,7 @@ mod tests {
         let as_ = |actor: &Actor| Ekko::new(Storage::new(&dir).unwrap()).acting_as(actor.clone());
         let note = |actor: &Actor, task: u32, text: &str| crate::agents_merge::noted(&as_(actor), &[task], text).unwrap()[0];
         let person = as_(&Actor::person());
-        for text in ["Release v0.15.0", "Add the API", "Use the API", "Unrelated work", "filler", "filler"] {
+        for text in ["Release v0.15.0", "Add the API", "Use the API", "Unrelated work", "Write the docs", "filler"] {
             person.create_task(&[text.to_string()]).unwrap();
         }
         set(&as_(&other), 1, "progress", false);
@@ -636,6 +637,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(3));
         wait_on(&as_(&me), 1, "done", "land 380: rebase, test, push");
         wait_on(&as_(&other), 2, "done", "use the API");
+        wait_on(&as_(&me), 5, "done", "link the docs");
         let asker = as_(&me);
         let mut draft = Draft::open(&asker).unwrap();
         let asked = draft.ask("Merge now?", None).unwrap();
@@ -646,6 +648,7 @@ mod tests {
         draft.answer(&Ref::Id(asked), "yes, after the rebase").unwrap();
         draft.commit(false).unwrap();
         note(&Actor::person(), 2, "Keep the old route too.");
+        set(&person, 5, "done", false);
         let open = [person.storage.get().unwrap()[&asked].uid.clone().unwrap()];
 
         told_alike(&as_(&me), &me, true, &open, &dir.join("alike-holding"));
