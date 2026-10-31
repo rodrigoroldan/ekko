@@ -64,6 +64,11 @@ CREATE INDEX lengths_place ON lengths(place);
 /// which is what lets SQLite read the index for it.
 const GUARDED: &str = "json_extract(body, '$.cue') IS NOT NULL OR json_extract(body, '$.question.allow') IS NOT NULL";
 
+/// The items holding a holder: a task in progress, which keeps who took it
+/// in heldBy. A note's writer is told by the tasks its process holds
+/// (`wake::untold`).
+const HELD: &str = "json_extract(body, '$.heldBy') IS NOT NULL";
+
 /// An item whose uid has not the shape `is_uid` reads, in SQL: references
 /// to it are not in refs, so a read by query could miss them. A board
 /// written by hand or grown by a script may hold one; ekko makes none.
@@ -71,10 +76,12 @@ const ODD_UID: &str = "uid IS NOT NULL AND NOT (length(uid) BETWEEN 18 AND 33 AN
      AND substr(uid, 1, 16) NOT GLOB '*[^0-9a-f]*' AND substr(uid, 18) NOT GLOB '*[^0-9a-f]*')";
 
 /// Lays out what layout 2 adds: `DERIVED`, and the partial indexes on the
-/// items the guard reads and on those whose uid is odd.
+/// items the guard reads, on those holding a holder and on those whose uid
+/// is odd.
 fn lay_derived(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(DERIVED)?;
     conn.execute_batch(&format!("CREATE INDEX items_guarded ON items(id) WHERE {GUARDED};"))?;
+    conn.execute_batch(&format!("CREATE INDEX items_held ON items(id) WHERE {HELD};"))?;
     conn.execute_batch(&format!("CREATE INDEX items_odd_uid ON items(id) WHERE {ODD_UID};"))?;
     Ok(())
 }
@@ -431,6 +438,13 @@ impl Database {
             }
         }
         parse(rows)
+    }
+
+    /// The items holding a holder (`HELD`), by the partial index on them.
+    pub fn held(&self) -> Result<Vec<u32>, StorageError> {
+        let mut statement = self.conn.prepare_cached(&format!("SELECT id FROM items INDEXED BY items_held WHERE {HELD} ORDER BY id"))?;
+        let ids = statement.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        Ok(ids)
     }
 
     /// How many items the board holds.

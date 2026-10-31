@@ -8115,6 +8115,10 @@ mod tests {
             assert_eq!(crate::wake::hook(&as_holder, &input, &home, "default board"), std::process::ExitCode::from(2), "the hook wakes the session");
             assert_eq!(crate::wake::hook(&as_holder, &input, &home, "default board"), std::process::ExitCode::SUCCESS, "once");
             assert!(untold(&holder, 0).is_empty(), "and its reply does not tell it again");
+            // From every cursor, what each session is told from the items its
+            // read names is what the whole board tells it (task 2234).
+            crate::wake::told_alike(&as_holder, &holder, false, &[], &home.join("alike-holder"));
+            crate::wake::told_alike(&as_asker, &asker, false, &[uid(asked)], &home.join("alike-asker"));
 
             let data = board();
             let mut resolved = data[&first].clone();
@@ -8131,6 +8135,35 @@ mod tests {
             theirs.created_by = Some(holder.holder(1));
             assert!(feedback(&data[&first]) && feedback(&data[&changes]) && feedback(&worded), "feedback");
             assert!(!feedback(&data[&asked]) && !feedback(&resolved) && !feedback(&settled) && !feedback(&bare) && !feedback(&theirs), "not feedback");
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// Feedback on an artifact no session holds is told to the session
+        /// that asked about it from the session's own read as from the whole
+        /// board (task 2234): the question that makes it a session working
+        /// the artifact is two references from the comment, through the
+        /// artifact, and nothing in the artifact's blockedBy group is held.
+        #[test]
+        fn feedback_on_an_artifact_nobody_holds_is_told_by_query_as_by_the_whole_board() {
+            let home = crate::paths::test_dir("ekko-artifact-told-query");
+            let dir = home.join(".ekko");
+            let (holder, asker, _) = test_sessions();
+            let (as_holder, as_asker, as_user) = (ekko_at(&dir, &holder), ekko_at(&dir, &asker), ekko_at(&dir, &Actor::person()));
+            let target = artifact(&as_holder, json!({"text": plan("Ship the page"), "steps": [{"key": "one", "text": "The step"}]})).unwrap();
+            let asked = ask(&as_asker, &home, target).unwrap();
+            let uid = |id: u32| as_user.storage.get().unwrap()[&id].uid.clone().unwrap();
+            let quote = crate::item::Quote { exact: "Text.".into(), prefix: String::new(), suffix: String::new(), section: String::new(), unknown: Default::default() };
+            let pending = crate::item::Comment { version: 1, quote: Some(quote), replacement: None, step: None, reply_to: None, sent: None, resolved: None, applied: None, theme: None, color: None, unknown: Default::default() };
+            let on = Ref::Id(target);
+            let mut draft = Draft::open(&as_user).unwrap();
+            let comment = draft.comment(&on, "Why text?", pending).unwrap();
+            draft.commit(false).unwrap();
+            let mut draft = Draft::open(&as_user).unwrap();
+            draft.send_comment(&on, &uid(comment)).unwrap();
+            draft.commit(false).unwrap();
+            assert!(as_user.storage.get().unwrap().values().all(|item| item.held_by.is_none()), "nothing held");
+
+            crate::wake::told_alike(&as_asker, &asker, false, &[uid(asked)], &home.join("alike-asker"));
             std::fs::remove_dir_all(&home).ok();
         }
 
@@ -8197,6 +8230,7 @@ mod tests {
             );
             assert_eq!(untold(&holder), vec![said], "the session working the plan, through its step one");
             assert!(untold(&idle).is_empty(), "no other session");
+            crate::wake::told_alike(&as_holder, &holder, false, &[], &home.join("alike-holder"));
             let read = crate::feedback::read(&board()[&target], &board(), Some(&holder));
             assert!(
                 read.contains(&format!("Comment {note} from the user, sent alone, on step three (task {three}): Start this -- the user's Start: set its task in progress and take it up, which resolves it\n")),

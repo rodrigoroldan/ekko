@@ -172,7 +172,60 @@ fn forget_ended(home: &Path) {
 /// started from: its prime, or the changes its resume was given, already
 /// said what came before.
 pub fn untold(ekko: &Ekko, me: &Actor, told: &Told, since: u64, holding: bool) -> Result<Vec<String>, EkkoError> {
-    let all = ekko.storage.get_shared()?;
+    untold_in(&*read(ekko, since, false)?, me, told, since, holding)
+}
+
+/// What `untold` reads (task 2234). Every line it tells is about a note a
+/// write moved past `since` -- feedback sent, a wait ended or kept, a
+/// question answered, a note written: the write that does it stamps the
+/// note with its revision -- and what the line draws on besides is within
+/// two references of that note, as `Database::working_set` reads them, but
+/// for the tasks its writer's process holds, which the items holding a
+/// holder add. So: those items, read alone; the whole board where this
+/// process keeps it, where more than an eighth of the board moved past
+/// `since`, or where the board has no database of this layout. `forced`
+/// reads them alone whatever this process keeps and however many moved:
+/// for the tests that hold one read to the other.
+fn read(ekko: &Ekko, since: u64, forced: bool) -> Result<std::sync::Arc<crate::storage::ItemMap>, EkkoError> {
+    let since = i64::try_from(since).unwrap_or(i64::MAX);
+    let read = ekko.storage.working_set_of(forced, |db| {
+        let moved = db.moved_between(since, i64::MAX)?;
+        if !forced && moved.len() * 8 > db.items()? {
+            return Ok(None);
+        }
+        Ok(Some(moved.into_iter().chain(db.held()?).map(|id| id.to_string()).collect()))
+    })?;
+    match read {
+        Some((all, _)) => Ok(all),
+        None => Ok(ekko.storage.get_shared()?),
+    }
+}
+
+/// Holds what `untold` tells `me` on `board` from the items its read names
+/// to what it tells from the whole board (task 2234), from every cursor up
+/// to the board's revision: each side with markers of its own, made afresh
+/// in `dir`, where this process's ask left the questions `open` open.
+#[cfg(test)]
+pub(crate) fn told_alike(board: &Ekko, me: &Actor, holding: bool, open: &[String], dir: &Path) {
+    let whole = board.storage.get_shared().unwrap();
+    let revision = board.storage.get_counters().unwrap().revision;
+    let mut told = 0;
+    for since in 0..=revision {
+        let fresh = |side: &str| {
+            let told = Told::within(&dir.join(format!("{side}-{since}")), me.process.as_ref().unwrap());
+            open.iter().for_each(|uid| told.left_open(uid));
+            told
+        };
+        let alone = untold_in(&read(board, since, true).unwrap(), me, &fresh("read"), since, holding).unwrap();
+        let expected = untold_in(&whole, me, &fresh("whole"), since, holding).unwrap();
+        assert_eq!(alone, expected, "since {since}");
+        told += expected.len();
+    }
+    assert!(told > 0, "nothing was told from any cursor, so nothing was compared");
+}
+
+/// `untold`, over `all`: the whole board, or what `read` found.
+fn untold_in(all: &crate::storage::ItemMap, me: &Actor, told: &Told, since: u64, holding: bool) -> Result<Vec<String>, EkkoError> {
     let registry = me.registry.as_ref();
     // Its own, or its conversation's from before a restart or from the
     // process Claude Code moved it out of, as a question's answer is
@@ -339,7 +392,7 @@ pub fn untold(ekko: &Ekko, me: &Actor, told: &Told, since: u64, holding: bool) -
         if rev <= since || note.timestamp < holder.since || note.created_by.as_ref().is_some_and(mine) || !told.mark(&format!("note-{uid}")) {
             continue;
         }
-        let from = note.created_by.as_ref().map_or_else(|| "someone".to_string(), |by| writer(&all, by, &name(by)));
+        let from = note.created_by.as_ref().map_or_else(|| "someone".to_string(), |by| writer(all, by, &name(by)));
         lines.push(format!("Note {} on task {} ({}), which this session holds, from {from}: {}", note.id, task.id, titled(task), agent::clip(&note.description, NOTED)));
     }
     Ok(lines)
@@ -557,6 +610,46 @@ mod tests {
         set(&board, 1, "done", false);
         note(&other, 1, "After it was done.");
         assert!(untold(&board, &me, &afresh("done"), 0, false).unwrap().is_empty(), "a task it no longer holds");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What untold tells from the items its read names (task 2234) is what
+    /// it tells from the whole board, from every cursor, in a reply and by
+    /// the hook: a wait of this session's that another's write ended, a
+    /// wait another session keeps on a task this one holds, the answer to a
+    /// question its ask left open, and notes written on a task it holds --
+    /// one by a session named by the tasks it holds, one of which no
+    /// reference from the note reaches.
+    #[test]
+    fn untold_from_its_read_is_untold_from_the_whole_board() {
+        let (me, other, _) = crate::holder::test_sessions();
+        let dir = crate::paths::test_dir("ekko-wake-alike");
+        let as_ = |actor: &Actor| Ekko::new(Storage::new(&dir).unwrap()).acting_as(actor.clone());
+        let note = |actor: &Actor, task: u32, text: &str| crate::agents_merge::noted(&as_(actor), &[task], text).unwrap()[0];
+        let person = as_(&Actor::person());
+        for text in ["Release v0.15.0", "Add the API", "Use the API", "Unrelated work", "filler", "filler"] {
+            person.create_task(&[text.to_string()]).unwrap();
+        }
+        set(&as_(&other), 1, "progress", false);
+        set(&as_(&other), 4, "progress", false);
+        set(&as_(&me), 2, "progress", false);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        wait_on(&as_(&me), 1, "done", "land 380: rebase, test, push");
+        wait_on(&as_(&other), 2, "done", "use the API");
+        let asker = as_(&me);
+        let mut draft = Draft::open(&asker).unwrap();
+        let asked = draft.ask("Merge now?", None).unwrap();
+        draft.commit(false).unwrap();
+        note(&other, 2, "The route is /v2/items now.");
+        set(&as_(&other), 1, "done", false);
+        let mut draft = Draft::open(&person).unwrap();
+        draft.answer(&Ref::Id(asked), "yes, after the rebase").unwrap();
+        draft.commit(false).unwrap();
+        note(&Actor::person(), 2, "Keep the old route too.");
+        let open = [person.storage.get().unwrap()[&asked].uid.clone().unwrap()];
+
+        told_alike(&as_(&me), &me, true, &open, &dir.join("alike-holding"));
+        told_alike(&as_(&me), &me, false, &open, &dir.join("alike"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
