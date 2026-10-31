@@ -2448,12 +2448,11 @@ fn changed_set<'a>(
         }
     }
     let read = ekko.storage.working_set_of(even_if_kept, |db| {
-        let moved = db.moved_between(since, cursor)?;
         // Past an eighth of the board, the working set is most of it, and
         // the whole board, parsed at once, is the cheaper read.
-        if moved.len() * 8 > db.items()? {
+        let Some(moved) = db.moved_between(since, cursor)? else {
             return Ok(None);
-        }
+        };
         let mut targets: Vec<String> = moved.into_iter().map(|id| id.to_string()).collect();
         targets.append(&mut named);
         Ok(Some(targets))

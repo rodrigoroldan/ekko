@@ -191,7 +191,7 @@ pub fn untold(ekko: &Ekko, me: &Actor, told: &Told, since: u64, holding: bool) -
 fn read(ekko: &Ekko, since: u64, forced: bool) -> Result<std::sync::Arc<crate::storage::ItemMap>, EkkoError> {
     let since = i64::try_from(since).unwrap_or(i64::MAX);
     let read = ekko.storage.working_set_of(forced, |db| {
-        if !forced && db.moved_between(since, i64::MAX)?.len() * 8 > db.items()? {
+        if !forced && db.moved_between(since, i64::MAX)?.is_none() {
             return Ok(None);
         }
         Ok(Some(db.tellable(since)?.into_iter().chain(db.held()?).map(|id| id.to_string()).collect()))

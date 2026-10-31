@@ -473,11 +473,20 @@ impl Database {
     }
 
     /// The items whose revision is past `since` and no later than `cursor`,
-    /// by the index on rev.
-    pub fn moved_between(&self, since: i64, cursor: i64) -> Result<Vec<u32>, StorageError> {
-        let mut statement = self.conn.prepare_cached("SELECT id FROM items WHERE rev > ?1 AND rev <= ?2 ORDER BY id")?;
-        let ids = statement.query_map([since, cursor], |row| row.get(0))?.collect::<Result<_, _>>()?;
-        Ok(ids)
+    /// by the index on rev, in id order -- or `None` where they are more
+    /// than an eighth of the board's items: what reads them then reads most
+    /// of the board, and the whole board, parsed at once, is the cheaper
+    /// read. The index is read no further than that eighth, so a cursor far
+    /// back costs no more than one near it.
+    pub fn moved_between(&self, since: i64, cursor: i64) -> Result<Option<Vec<u32>>, StorageError> {
+        let most = self.items()? / 8;
+        let mut statement = self.conn.prepare_cached("SELECT id FROM items WHERE rev > ?1 AND rev <= ?2 LIMIT ?3")?;
+        let mut ids: Vec<u32> = statement.query_map(params![since, cursor, most as i64 + 1], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        if ids.len() > most {
+            return Ok(None);
+        }
+        ids.sort_unstable();
+        Ok(Some(ids))
     }
 
     /// Every item's JSON as stored, one a line, unparsed.
@@ -959,6 +968,33 @@ mod tests {
         let rows = derived(&db.conn);
         assert!(!rows.iter().any(|row| row.contains("lexer")), "a removed item's words stayed: {rows:?}");
         assert_eq!(rows, rebuilt(&db.conn));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The items that moved between two revisions come in id order, up to
+    /// an eighth of the board's items -- two of sixteen -- and past it none
+    /// come: the whole board is read instead.
+    #[test]
+    fn what_moved_is_named_up_to_an_eighth_of_the_board() {
+        let dir = crate::paths::test_dir("ekko-database-moved");
+        fs::create_dir_all(&dir).unwrap();
+        let mut db = Database::create(&dir.join(FILE)).unwrap();
+        let mut items: Vec<Item> = (1..=16).map(|id| Item::new_task(id, format!("task {id}"), vec!["@a".into()], 1)).collect();
+        items.iter_mut().for_each(|item| item.rev = Some(1));
+        write(&mut db, 1, items.iter().map(|item| Change { id: item.id, after: Some(item) }).collect());
+        // Item 5 moves before item 3, so the index on rev holds them 5, 3.
+        for (rev, id) in [(2, 5), (3, 3)] {
+            items[id - 1].rev = Some(rev);
+            write(&mut db, rev, vec![Change { id: id as u32, after: Some(&items[id - 1]) }]);
+        }
+        assert_eq!(db.moved_between(1, i64::MAX).unwrap(), Some(vec![3, 5]));
+
+        items[8].rev = Some(4);
+        write(&mut db, 4, vec![Change { id: 9, after: Some(&items[8]) }]);
+        assert_eq!(db.moved_between(1, i64::MAX).unwrap(), None, "three of sixteen moved, past an eighth");
+        assert_eq!(db.moved_between(1, 3).unwrap(), Some(vec![3, 5]), "a write past the cursor was named");
+        assert_eq!(db.moved_between(2, i64::MAX).unwrap(), Some(vec![3, 9]));
 
         fs::remove_dir_all(&dir).ok();
     }
