@@ -486,6 +486,9 @@ pub struct NoteRef {
     pub knowledge: Option<Knowledge>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub superseded_by: Vec<u32>,
+    /// Whether it is its task's handoff in force; see `Item::handoff`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub handoff: bool,
     /// On a question: whether it has been answered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answered: Option<bool>,
@@ -508,8 +511,8 @@ pub struct NoteRef {
 impl NoteRef {
     /// What a listing puts before a typed note's text -- "[gotcha] ", or
     /// "[decision, superseded by 9] ", "[gotcha, to recheck] ", "[question] ",
-    /// "[handoff, replaced by 12] ", "[comment, sent] " -- and nothing before
-    /// an ordinary one.
+    /// "[handoff] ", "[handoff, replaced by 12] ", "[comment, sent] " -- and
+    /// nothing before an ordinary one.
     fn mark(&self) -> String {
         if let Some(feedback) = &self.feedback {
             return format!("[{feedback}] ");
@@ -521,6 +524,7 @@ impl NoteRef {
             return if waiting { "[waiting] " } else { "[wait over] " }.to_string();
         }
         match (self.knowledge, self.superseded_by.as_slice()) {
+            (None, []) if self.handoff => "[handoff] ".to_string(),
             (None, []) => String::new(),
             (None, newer) => format!("[handoff, replaced by {}] ", join(newer)),
             (Some(kind), newer) => {
@@ -686,6 +690,7 @@ impl<'a> Reader<'a> {
             description: note.description.clone(),
             knowledge: note.knowledge,
             superseded_by: self.superseded_by(note.id),
+            handoff: note.handoff,
             answered: note.question.as_ref().map(|question| question.answer.is_some()),
             waiting: note.wait.as_ref().map(|wait| wait.over.is_none()),
             cue: crate::guard::cue_of(note).is_some(),
@@ -2957,11 +2962,15 @@ fn recheck_line(recheck: &[String], indent: usize) -> Option<String> {
 }
 
 /// What a listing says an item is, in brackets: a task's state or a note's
-/// kind, and for a superseded note, what supersedes it -- for a note without
-/// a kind, the later handoff that replaced it -- or for one in force that
-/// its anchors say to recheck, that.
+/// kind, the handoff in force named as one; for a superseded note, what
+/// supersedes it -- for a note without a kind, the later handoff that
+/// replaced it -- or for one in force that its anchors say to recheck, that.
 fn listed_state(entry: &Entry) -> String {
-    let word = entry.knowledge.map_or_else(|| word_or_note(entry.state), Knowledge::word);
+    let word = match entry.knowledge {
+        Some(kind) => kind.word(),
+        None if entry.handoff => "handoff",
+        None => word_or_note(entry.state),
+    };
     match (entry.knowledge, entry.superseded_by.as_slice()) {
         (_, []) if !entry.recheck.is_empty() => format!("{word}, {TO_RECHECK}"),
         (_, []) => word.to_string(),
@@ -5332,6 +5341,37 @@ mod tests {
         assert!(current.contains("\nReplaces, an earlier handoff\n   2. [handoff, replaced] stopped"), "{current}");
         let found = search(&ekko, Some("parser"), &[], 20).unwrap().text();
         assert!(found.contains("   2. [handoff, replaced by 3] "), "{found}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The handoff in force reads as a handoff wherever a listing names it,
+    /// as the replaced one does: search and changes once called it a note,
+    /// since only a replaced handoff told itself apart (task 2262).
+    #[test]
+    fn every_listing_marks_the_current_handoff_as_one() {
+        let (ekko, dir) = board("handoff-current");
+        ekko.create_task(&words(&["the work"])).unwrap();
+        let cursor = prime(&ekko, "default board").unwrap().cursor;
+        write(
+            &ekko,
+            &[
+                serde_json::json!({"op": "create", "kind": "handoff", "text": "stopped at the parser", "attached_to": 1}),
+                serde_json::json!({"op": "create", "kind": "handoff", "text": "parser done, tests next", "attached_to": 1}),
+                serde_json::json!({"op": "create", "kind": "note", "text": "the parser reads tabs", "attached_to": 1}),
+            ],
+        );
+
+        let listings = [
+            ("search", search(&ekko, Some("parser"), &[], 20).unwrap().text()),
+            ("changes", changes(&ekko, cursor).unwrap().text()),
+            ("context", context(&ekko, "1").unwrap().text()),
+        ];
+        for (read, text) in &listings {
+            assert!(text.contains("   2. [handoff, replaced by 3] stopped"), "{read}: {text}");
+            assert!(text.contains("   3. [handoff] parser done"), "{read}: {text}");
+            assert!(!text.contains("4. [handoff"), "{read} marks a plain note: {text}");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
