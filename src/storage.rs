@@ -195,6 +195,19 @@ pub fn storage_file(ekko_dir: &Path) -> PathBuf {
     ekko_dir.join("storage").join("storage.json")
 }
 
+/// The items of the board in `ekko_dir`, from wherever it keeps them: its
+/// database, or storage.json before it has one. Read only, making no folder
+/// and no database, unlike `Storage::new`: for a look at a board this
+/// process does not open, such as the projects' listing. A board with
+/// neither file is empty; storage.json as the stamp, with its database gone,
+/// is an error, since it is not a board.
+pub fn peek(ekko_dir: &Path) -> Result<ItemMap, StorageError> {
+    if let Some(db) = Database::open_to_read(&ekko_dir.join("storage").join(database::FILE))? {
+        return Ok(db.load()?.1);
+    }
+    read_map(&storage_file(ekko_dir))
+}
+
 impl Storage {
     pub fn new(ekko_dir: &Path) -> Result<Self, StorageError> {
         let storage_dir = ekko_dir.join("storage");

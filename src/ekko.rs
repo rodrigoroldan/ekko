@@ -5160,14 +5160,23 @@ mod tests {
     /// and trashed items are away, and a cancelled task is not in the total.
     /// It used to count everything, and showed winwayland at [46/54] while
     /// the project itself said 88%.
+    ///
+    /// Each board is counted wherever it is kept: in its database, as ekko
+    /// writes one since 0.46.0, or still as storage.json, never written
+    /// since. A board written by hand as storage.json alone kept this test
+    /// passing while every real board listed at [0/0] (task 2259). A legacy
+    /// project under ~/.ekko/projects/ is counted the same way.
     #[test]
     fn the_project_listing_counts_the_way_the_project_does() {
         let home = crate::paths::test_dir("ekko-core-listing");
-        let folder = home.join("work").join("p");
-        fs::create_dir_all(&folder).unwrap();
-        crate::project::init(&home, &folder, None, None, 0).unwrap();
-        let storage = folder.join(".ekko").join("storage");
-        fs::create_dir_all(&storage).unwrap();
+        let mut boards = Vec::new();
+        for name in ["p", "r"] {
+            let folder = home.join("work").join(name);
+            fs::create_dir_all(&folder).unwrap();
+            crate::project::init(&home, &folder, None, None, 0).unwrap();
+            boards.push(folder.join(".ekko"));
+        }
+        let (written, legacy, json) = (&boards[0], home.join(".ekko").join("projects").join("q").join(".ekko"), &boards[1]);
 
         let mut done = Item::new_task(1, "done".into(), vec![], 1);
         State::Done.write(&mut done);
@@ -5179,10 +5188,15 @@ mod tests {
         gone.trashed = Some(1);
         let why = Item::new_note(5, "why".into(), vec![]);
         let items: ItemMap = [done, dropped, away, gone, why].into_iter().map(|i| (i.id, i)).collect();
-        fs::write(storage.join("storage.json"), serde_json::to_string(&items).unwrap()).unwrap();
+        Storage::new(written).unwrap().set(&items).unwrap();
+        Storage::new(&legacy).unwrap().set(&items).unwrap();
+        assert!(written.join("storage").join(crate::database::FILE).exists(), "the board was not written to its database");
+        fs::create_dir_all(json.join("storage")).unwrap();
+        fs::write(json.join("storage").join("storage.json"), serde_json::to_string(&items).unwrap()).unwrap();
 
         let listing = crate::project::list(&home);
-        assert_eq!((listing[0].complete, listing[0].tasks, listing[0].notes), (1, 1, 1));
+        let counted: Vec<(&str, u32, u32, u32)> = listing.iter().map(|p| (p.name.as_str(), p.complete, p.tasks, p.notes)).collect();
+        assert_eq!(counted, vec![("p", 1, 1, 1), ("q", 1, 1, 1), ("r", 1, 1, 1)]);
 
         fs::remove_dir_all(&home).ok();
     }

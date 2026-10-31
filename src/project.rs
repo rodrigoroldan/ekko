@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::directory::{DirectoryError, COPIES_DIR_NAME, EKKO_DIR_NAME, PROJECTS_DIR_NAME, TRASH_DIR_NAME};
 use crate::render::ProjectSummary;
-use crate::storage::{ItemMap, Storage};
+use crate::storage::Storage;
 
 pub(crate) const MARKER: &str = "project.json";
 const REGISTRY: &str = "projects.json";
@@ -790,7 +790,7 @@ pub fn list(home: &Path) -> Vec<ProjectSummary> {
         .map(|entry| {
             let here = read_marker(&entry.path).is_some_and(|found| found.id == entry.id);
             let (complete, tasks, notes) = if here {
-                count_items(&entry.path.join(EKKO_DIR_NAME).join("storage").join("storage.json"))
+                count_items(&entry.path.join(EKKO_DIR_NAME))
             } else {
                 (0, 0, 0)
             };
@@ -812,8 +812,8 @@ pub fn list(home: &Path) -> Vec<ProjectSummary> {
             if listed.iter().any(|project| project.name == name) {
                 continue;
             }
-            let storage = entry.path().join(EKKO_DIR_NAME).join("storage").join("storage.json");
-            let (complete, tasks, notes) = count_items(&storage);
+            let board = entry.path().join(EKKO_DIR_NAME);
+            let (complete, tasks, notes) = count_items(&board);
             listed.push(ProjectSummary { name, complete, tasks, notes, path: None, status: "legacy", copied: None });
         }
     }
@@ -882,16 +882,14 @@ pub fn forget(home: &Path, name: &str, now_millis: i64) -> Result<Forgotten, Dir
     Ok(Forgotten { name: entry.name, path: entry.path, parked })
 }
 
-/// Reads one project's storage directly rather than through `Storage`, which
-/// creates the directories it expects -- a side effect no listing should
-/// have. An absent file is an empty project, and so is one that cannot be
-/// parsed: failing the whole listing over one bad project would hide the good
-/// ones, and opening that project reports the real error.
-fn count_items(storage_file: &Path) -> (u32, u32, u32) {
-    let Ok(contents) = fs::read_to_string(storage_file) else {
-        return (0, 0, 0);
-    };
-    let Ok(items) = serde_json::from_str::<ItemMap>(&contents) else {
+/// Counts the board in `ekko_dir` through `storage::peek`, wherever it keeps
+/// its items, rather than through `Storage`, which creates the directories it
+/// expects -- a side effect no listing should have. An absent board is an
+/// empty project, and so is one that cannot be read: failing the whole
+/// listing over one bad project would hide the good ones, and opening that
+/// project reports the real error.
+fn count_items(ekko_dir: &Path) -> (u32, u32, u32) {
+    let Ok(items) = crate::storage::peek(ekko_dir) else {
         return (0, 0, 0);
     };
 
@@ -907,6 +905,7 @@ fn count_items(storage_file: &Path) -> (u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::ItemMap;
 
     const NOW: i64 = 1787600000000;
 

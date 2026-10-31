@@ -97,6 +97,17 @@ impl Database {
         Ok(Some(Database::configured(conn)?))
     }
 
+    /// The database at `path`, opened to read only, or `None` where there
+    /// is no file there: for a look at a board this process does not keep,
+    /// which closing then never checkpoints into the file.
+    pub fn open_to_read(path: &Path) -> Result<Option<Database>, StorageError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        Ok(Some(Database::configured(conn)?))
+    }
+
     /// A new database at `path`, which must not exist, holding no item yet.
     /// Built with a rollback journal, so the file alone is the whole
     /// database until `seal` turns on the write-ahead log.
