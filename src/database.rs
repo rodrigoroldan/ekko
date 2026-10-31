@@ -58,6 +58,32 @@ CREATE INDEX words_item ON words(item);
 CREATE TABLE lengths (item INTEGER PRIMARY KEY, words INTEGER NOT NULL);
 ";
 
+/// The rows `Database::working_set` reads, given its targets' ids as a JSON
+/// array: the blockedBy group, however far, then two steps of every
+/// reference, each way.
+const WORKING_SET: &str = "
+WITH RECURSIVE
+  asked(id) AS (SELECT value FROM json_each(?1)),
+  grp(id) AS (
+    SELECT id FROM asked
+    UNION
+    SELECT b.id FROM grp JOIN refs r ON r.item = grp.id AND r.path = 'blockedBy' JOIN items b ON b.uid = r.target
+    UNION
+    SELECT r.item FROM grp JOIN items g ON g.id = grp.id JOIN refs r ON r.target = g.uid AND r.path = 'blockedBy'
+  ),
+  one(id) AS (
+    SELECT id FROM grp
+    UNION SELECT t.id FROM grp JOIN refs r ON r.item = grp.id JOIN items t ON t.uid = r.target
+    UNION SELECT r.item FROM grp JOIN items g ON g.id = grp.id JOIN refs r ON r.target = g.uid
+  ),
+  two(id) AS (
+    SELECT id FROM one
+    UNION SELECT t.id FROM one JOIN refs r ON r.item = one.id JOIN items t ON t.uid = r.target
+    UNION SELECT r.item FROM one JOIN items g ON g.id = one.id JOIN refs r ON r.target = g.uid
+  )
+SELECT id, body FROM items WHERE id IN (SELECT id FROM two) ORDER BY id
+";
+
 /// Whether `text` has the shape `item::new_uid` gives a uid: the time in
 /// nanoseconds, 16 hex digits, a dash, then the process id in hex. A
 /// holder's conversation and boot ids are UUIDs, of another shape.
@@ -278,6 +304,43 @@ impl Database {
         }
         tx.finish()?;
         Ok((writes, parse(rows)?))
+    }
+
+    /// The items a read of `targets` -- display ids, or uids -- needs, read
+    /// in one snapshot with the board's revision as its items have it (the
+    /// highest rev of any): `targets`, every item joined to them through
+    /// blockedBy either way however far, and two steps of every reference
+    /// either way from all of those (task 2234, note 2275). Only those rows
+    /// are parsed. A target that names no item is left out, for the caller
+    /// to refuse as it refuses one missing from the whole board.
+    pub fn working_set(&self, targets: &[String]) -> Result<(ItemMap, u64), StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut ids: Vec<u32> = Vec::new();
+        for raw in targets {
+            match raw.parse::<u32>() {
+                Ok(id) => ids.push(id),
+                Err(_) => ids.extend(tx.prepare_cached("SELECT min(id) FROM items WHERE uid = ?1")?.query_row([raw], |row| row.get::<_, Option<u32>>(0))?),
+            }
+        }
+        let mut rows = Vec::new();
+        {
+            let mut statement = tx.prepare_cached(WORKING_SET)?;
+            let mut found = statement.query([serde_json::to_string(&ids)?])?;
+            while let Some(row) = found.next()? {
+                rows.push((row.get::<_, u32>(0)?, row.get::<_, String>(1)?));
+            }
+        }
+        let revision: Option<i64> = tx.query_row("SELECT max(rev) FROM items", [], |row| row.get(0))?;
+        tx.finish()?;
+        Ok((parse(rows)?, revision.unwrap_or(0) as u64))
+    }
+
+    /// The items whose revision is past `since` and no later than `cursor`,
+    /// by the index on rev.
+    pub fn moved_between(&self, since: i64, cursor: i64) -> Result<Vec<u32>, StorageError> {
+        let mut statement = self.conn.prepare_cached("SELECT id FROM items WHERE rev > ?1 AND rev <= ?2 ORDER BY id")?;
+        let ids = statement.query_map([since, cursor], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        Ok(ids)
     }
 
     /// Every item's JSON as stored, one a line, unparsed.

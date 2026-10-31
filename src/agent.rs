@@ -1795,12 +1795,12 @@ pub fn context(ekko: &Ekko, target: &str) -> Result<Context, EkkoError> {
 /// otherwise spends a call apiece on. An id that names nothing refuses them
 /// all, the way it does for every other command.
 pub fn contexts(ekko: &Ekko, targets: &[String]) -> Result<Vec<Context>, EkkoError> {
-    let all = ekko.storage.get_shared()?;
-    let phases = ekko.storage.get_phases()?;
     let raw: Vec<String> = targets.iter().map(|target| target.trim_start_matches('@').to_string()).collect();
+    let (all, revision) = read_for(ekko, &raw)?;
+    let phases = ekko.storage.get_phases()?;
     let ids = ekko.validate_ids(&raw, &all)?;
     let reader = Reader::shared(&all, &phases).seen_by(ekko);
-    let mut read: Vec<Context> = ids.into_iter().map(|id| neighbourhood(&all, &reader, id)).collect();
+    let mut read: Vec<Context> = ids.into_iter().map(|id| neighbourhood(&all, &reader, id, revision)).collect();
     // One reading of the history for every item asked for.
     if let Some(folder) = &ekko.folder {
         let items: Vec<(u32, Option<&str>)> = read.iter().map(|context| (context.item.id, all[&context.item.id].uid.as_deref())).collect();
@@ -1820,6 +1820,18 @@ pub fn contexts(ekko: &Ekko, targets: &[String]) -> Result<Vec<Context>, EkkoErr
     Ok(read)
 }
 
+/// What a read of `targets` needs, and the board's revision as its items
+/// have it: the items its database names for them (`Storage::working_set`),
+/// or the whole board before the board has a database of this layout.
+fn read_for(ekko: &Ekko, targets: &[String]) -> Result<(Arc<ItemMap>, u64), EkkoError> {
+    if let Some(read) = ekko.storage.working_set(targets)? {
+        return Ok(read);
+    }
+    let all = ekko.storage.get_shared()?;
+    let revision = all.values().filter_map(|item| item.rev).max().unwrap_or(0);
+    Ok((all, revision))
+}
+
 /// Several neighbourhoods as one reply, each item described once: one that
 /// has a block of its own is pointed to from the others, not repeated.
 pub fn contexts_text(read: &[Context], detail: Detail) -> String {
@@ -1837,7 +1849,7 @@ fn with_recheck_how(mut text: String, rechecks: bool) -> String {
     text
 }
 
-fn neighbourhood(all: &ItemMap, reader: &Reader<'_>, id: u32) -> Context {
+fn neighbourhood(all: &ItemMap, reader: &Reader<'_>, id: u32, revision: u64) -> Context {
     let item = &all[&id];
 
     let link = |id: &u32| {
@@ -1882,7 +1894,6 @@ fn neighbourhood(all: &ItemMap, reader: &Reader<'_>, id: u32) -> Context {
     let entry = reader.entry(item);
     let supersedes = entry.supersedes.as_ref().and_then(link);
     let superseded_by = entry.superseded_by.iter().filter_map(link).collect();
-    let revision = all.values().filter_map(|other| other.rev).max().unwrap_or(0);
     let question = item.question.as_ref().map(|question| asked(item, question, reader, revision));
     let wait = item.wait.as_ref().map(|wait| {
         let to_waiter = reader.me.as_ref().is_some_and(|me| me.is(&wait.by));
@@ -2361,13 +2372,54 @@ const CLOCK_CURSOR: i64 = 100_000_000_000;
 ///
 /// A cursor from before revisions, a clock reading, is answered the old way,
 /// by `updatedAt`, and handed a revision to use from then on.
+/// What `changes` reads: the items that moved since revision `since` up to
+/// `cursor` and those `journal`'s lines after it name, with what their
+/// entries draw on, from the board's database (task 2234); the whole board
+/// for a clock cursor, or before the board has a database of this layout.
+fn changed_set<'a>(
+    ekko: &Ekko,
+    since: i64,
+    cursor: i64,
+    journal: impl Iterator<Item = &'a serde_json::Value>,
+) -> Result<Arc<ItemMap>, EkkoError> {
+    if since >= CLOCK_CURSOR {
+        return Ok(ekko.storage.get_shared()?);
+    }
+    // A line names an item by uid, and by id where it has none: both are
+    // read, so the id is there for `resolve` whichever it takes.
+    let mut named: Vec<String> = Vec::new();
+    for line in journal {
+        for item in ["released", "blocked"].iter().flat_map(|key| line[key].as_array().into_iter().flatten()) {
+            named.extend(item["uid"].as_str().map(str::to_string));
+            named.extend(item["id"].as_u64().map(|id| id.to_string()));
+        }
+    }
+    let read = ekko.storage.working_set_of(|db| {
+        let mut targets: Vec<String> = db.moved_between(since, cursor)?.into_iter().map(|id| id.to_string()).collect();
+        targets.append(&mut named);
+        Ok(targets)
+    })?;
+    match read {
+        Some((all, _)) => Ok(all),
+        None => Ok(ekko.storage.get_shared()?),
+    }
+}
+
 pub fn changes(ekko: &Ekko, since: i64) -> Result<Changes, EkkoError> {
     // The revision first, then the board and the journal: a writer publishes
     // the revision last, so every write up to `cursor` is already on disk.
     // A write past it shows in the board but waits for the next call, so no
     // change is skipped and none is told twice.
     let cursor = ekko.storage.get_counters()?.revision as i64;
-    let all = ekko.storage.get_shared()?;
+    let journal = ekko.storage.read_journal()?;
+    let after = |entry: &serde_json::Value| {
+        if since >= CLOCK_CURSOR {
+            entry["at"].as_i64().is_some_and(|at| at >= since)
+        } else {
+            entry["rev"].as_i64().is_some_and(|rev| rev > since && rev <= cursor)
+        }
+    };
+    let all = changed_set(ekko, since, cursor, journal.iter().filter(|entry| after(entry)))?;
     let phases = ekko.storage.get_phases()?;
     let reader = Reader::shared(&all, &phases).seen_by(ekko);
     let moved = |item: &&Item| {
@@ -2385,19 +2437,11 @@ pub fn changes(ekko: &Ekko, since: i64) -> Result<Changes, EkkoError> {
 
     // What the journal saw after the cursor: work set free or left waiting,
     // named only while it still is, and items taken out of storage.
-    let journal = ekko.storage.read_journal()?;
     let resolve = |named: &serde_json::Value| {
         named["uid"]
             .as_str()
             .and_then(|uid| reader.uid(uid))
             .or_else(|| named["id"].as_u64().map(|id| id as u32).filter(|id| all.get(id).is_some_and(|item| item.uid.is_none())))
-    };
-    let after = |entry: &serde_json::Value| {
-        if since >= CLOCK_CURSOR {
-            entry["at"].as_i64().is_some_and(|at| at >= since)
-        } else {
-            entry["rev"].as_i64().is_some_and(|rev| rev > since && rev <= cursor)
-        }
     };
     let (mut released, mut blocked, mut removed) = (BTreeSet::new(), BTreeSet::new(), Vec::new());
     // Read once, and only when something left storage.
@@ -5341,6 +5385,52 @@ mod tests {
         assert!(current.contains("\nReplaces, an earlier handoff\n   2. [handoff, replaced] stopped"), "{current}");
         let found = search(&ekko, Some("parser"), &[], 20).unwrap().text();
         assert!(found.contains("   2. [handoff, replaced by 3] "), "{found}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A context read from the items the board's database names for it
+    /// (task 2234) is the context read from the whole board, field for field
+    /// and line for line, for every item of a board holding a blocked line
+    /// longer than two steps, replaced handoffs and a decision superseded
+    /// from under another task; and an item linked to nothing reads only
+    /// itself.
+    #[test]
+    fn a_context_from_its_working_set_is_the_one_from_the_whole_board() {
+        let (ekko, dir) = board("working-set-context");
+        write(
+            &ekko,
+            &[
+                serde_json::json!({"op": "create", "text": "first step"}),
+                serde_json::json!({"op": "create", "text": "second step", "blocked_by": ["$1"]}),
+                serde_json::json!({"op": "create", "text": "third step", "blocked_by": ["$2"]}),
+                serde_json::json!({"op": "create", "text": "fourth step", "blocked_by": ["$3"]}),
+                serde_json::json!({"op": "create", "text": "fifth step", "blocked_by": ["$4"]}),
+                serde_json::json!({"op": "create", "text": "apart, waits on two", "blocked_by": ["$1", "$2"]}),
+                serde_json::json!({"op": "create", "kind": "handoff", "text": "stopped at one", "attached_to": "$2"}),
+                serde_json::json!({"op": "create", "kind": "handoff", "text": "stopped at two", "attached_to": "$2"}),
+                serde_json::json!({"op": "create", "kind": "decision", "text": "ship weekly", "attached_to": "$1"}),
+                serde_json::json!({"op": "create", "text": "elsewhere"}),
+                serde_json::json!({"op": "create", "kind": "decision", "text": "ship on demand", "supersedes": "$9", "attached_to": "$10"}),
+                serde_json::json!({"op": "create", "kind": "note", "text": "a loose note"}),
+                serde_json::json!({"op": "create", "text": "linked to nothing"}),
+            ],
+        );
+        ekko.set_state(&words(&["@1", "done"]), false).unwrap();
+        let phases = ekko.storage.get_phases().unwrap();
+        let all = ekko.storage.get_shared().unwrap();
+        let revision = all.values().filter_map(|item| item.rev).max().unwrap_or(0);
+        let read = |board: &Arc<ItemMap>, revision: u64, id: u32| {
+            let reader = Reader::shared(board, &phases).seen_by(&ekko);
+            let context = neighbourhood(board, &reader, id, revision);
+            (serde_json::to_string(&context).unwrap(), context.text_with(Detail::Full))
+        };
+        for &id in all.keys() {
+            let (part, part_revision) = ekko.storage.working_set_read(&[id.to_string()]).unwrap().expect("a database of this layout");
+            assert_eq!(read(&part, part_revision, id), read(&all, revision, id), "item {id}, read from {:?}", part.keys().collect::<Vec<_>>());
+        }
+        let (alone, _) = ekko.storage.working_set_read(&["13".to_string()]).unwrap().unwrap();
+        assert_eq!(alone.keys().copied().collect::<Vec<_>>(), vec![13], "an item linked to nothing read more than itself");
 
         std::fs::remove_dir_all(&dir).ok();
     }

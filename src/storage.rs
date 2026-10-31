@@ -322,6 +322,45 @@ impl Storage {
         }
     }
 
+    /// What a read of `targets` -- display ids, or uids -- needs, with the
+    /// board's revision as its items have it: the whole board where this
+    /// process already keeps this version of it, which costs nothing more;
+    /// otherwise only the items `Database::working_set` names, parsed alone
+    /// (task 2234). `None` where the board has no database of this layout
+    /// yet, for the caller to read the whole board.
+    pub fn working_set(&self, targets: &[String]) -> Result<Option<(Arc<ItemMap>, u64)>, StorageError> {
+        self.working_set_of(|_| Ok(targets.to_vec()))
+    }
+
+    /// `working_set`, its targets found in the database by `targets` -- the
+    /// items that moved since a revision, say -- only when it reads there.
+    #[rustfmt::skip]
+    pub fn working_set_of(&self, targets: impl FnOnce(&Database) -> Result<Vec<String>, StorageError>) -> Result<Option<(Arc<ItemMap>, u64)>, StorageError> {
+        let mut opened = self.database.lock().unwrap_or_else(PoisonError::into_inner);
+        self.open_database(&mut opened)?;
+        let Some(open) = opened.as_ref() else { return Ok(None) };
+        if open.db.layout()? != database::LAYOUT {
+            return Ok(None);
+        }
+        if let Some(board) = kept_board(&self.database_file, Version::of_database(open.file, open.db.writes()?)) {
+            let revision = board.values().filter_map(|item| item.rev).max().unwrap_or(0);
+            return Ok(Some((board, revision)));
+        }
+        let (board, revision) = open.db.working_set(&targets(&open.db)?)?;
+        Ok(Some((Arc::new(board), revision)))
+    }
+
+    /// `working_set` from the database alone, whatever this process keeps:
+    /// for the tests that hold its answers to the whole board's.
+    #[cfg(test)]
+    pub fn working_set_read(&self, targets: &[String]) -> Result<Option<(Arc<ItemMap>, u64)>, StorageError> {
+        let mut opened = self.database.lock().unwrap_or_else(PoisonError::into_inner);
+        self.open_database(&mut opened)?;
+        let Some(open) = opened.as_ref() else { return Ok(None) };
+        let (board, revision) = open.db.working_set(targets)?;
+        Ok(Some((Arc::new(board), revision)))
+    }
+
     /// The board as storage.json holds it, before its database.
     fn json_board(&self) -> Result<Arc<ItemMap>, StorageError> {
         let Some((file, version)) = open_versioned(&self.storage_file)? else {
@@ -2165,8 +2204,11 @@ mod tests {
     /// Every public method of `Storage` that only reads, and every one that
     /// writes the board's folder: the writes are what a refused storage
     /// refuses (task 1576).
-    const READS: [&str; 14] = [
+    const READS: [&str; 17] = [
         "get",
+        "working_set",
+        "working_set_of",
+        "working_set_read",
         "get_shared",
         "get_archive",
         "storage_path",
