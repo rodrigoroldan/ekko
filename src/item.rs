@@ -306,6 +306,13 @@ pub struct Item {
     /// see `question`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<Box<Baseline>>,
+    /// On a task or a note a session of another project created here (task
+    /// 2258): where it came from, and whether this board accepted it. Until
+    /// it is accepted, or taken up, the prime lists it apart, as received,
+    /// and it is no work to take up. Absent unless set, so a board nothing
+    /// was sent to is stored exactly as before. Boxed; see `question`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received: Option<Box<Received>>,
     // Old data may have this stored as a JSON string (a bug in the JS
     // version's --priority path, fixed here rather than carried forward) --
     // still readable, but always written back out as a number now.
@@ -363,6 +370,7 @@ impl Item {
             review: None,
             rests_on: None,
             baseline: None,
+            received: None,
             held_by: None,
             done_by: None,
             created_by: None,
@@ -408,6 +416,7 @@ impl Item {
             review: None,
             rests_on: None,
             baseline: None,
+            received: None,
             held_by: None,
             done_by: None,
             created_by: None,
@@ -979,6 +988,29 @@ impl Answer {
     }
 }
 
+/// Where an item another project's session created came from (task 2258);
+/// see `Item::received`. Who created it, and when, are its `createdBy`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Received {
+    /// The project whose session created it, or `default board`.
+    pub from: String,
+    /// When this board accepted it, in milliseconds: it then joins the
+    /// board's work, and the prime no longer lists it as received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<i64>,
+    /// What a later version keeps here that this one does not know, written
+    /// back as read; see `Item::unknown`.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
+}
+
+impl Received {
+    /// Received from `from`, not yet accepted.
+    pub fn new(from: &str) -> Received {
+        Received { from: from.to_string(), accepted: None, unknown: BTreeMap::new() }
+    }
+}
+
 /// A session waiting on an item until it reaches what the session needs;
 /// see `Item::wait`. The note's text is what the session will do then: the
 /// holder reads why, and a session told after a /clear knows what to do.
@@ -1362,7 +1394,8 @@ impl State {
 }
 
 /// What `--set` and `set_state` ask for: a state for a task to end up in,
-/// `undone`, or a star put on or taken off.
+/// `undone`, a star put on or taken off, or an item received from another
+/// project accepted.
 ///
 /// The words for these are spelled in `word`, and read back in `from_word`,
 /// and nowhere else. They used to be strings matched in several places, one
@@ -1380,11 +1413,14 @@ pub enum Setting {
     Undone,
     Starred,
     Unstarred,
+    /// `accepted`: an item received from another project joins the board's
+    /// work (task 2258); see `Item::received`.
+    Accepted,
 }
 
 impl Setting {
     /// Every setting, in the order a caller is told them.
-    pub const ALL: [Setting; 9] = [
+    pub const ALL: [Setting; 10] = [
         Setting::Become(State::Done),
         Setting::Undone,
         Setting::Become(State::Progress),
@@ -1394,6 +1430,7 @@ impl Setting {
         Setting::Become(State::Pending),
         Setting::Starred,
         Setting::Unstarred,
+        Setting::Accepted,
     ];
 
     /// The word for it: what `--json` reports and the MCP schema lists.
@@ -1408,6 +1445,7 @@ impl Setting {
             Setting::Become(State::Pending) => "unstarted",
             Setting::Starred => "starred",
             Setting::Unstarred => "unstarred",
+            Setting::Accepted => "accepted",
         }
     }
 
@@ -1427,14 +1465,27 @@ impl Setting {
             "cancel" | "cancelled" | "canceled" => Setting::Become(State::Cancelled),
             "star" | "starred" => Setting::Starred,
             "unstar" | "unstarred" => Setting::Unstarred,
+            "accept" | "accepted" => Setting::Accepted,
             _ => return None,
         })
     }
 
     /// Whether this is about a task's state, which a note does not have.
-    /// Starring is the one setting that applies to both.
+    /// Starring and accepting apply to both.
     pub fn is_state(self) -> bool {
-        !matches!(self, Setting::Starred | Setting::Unstarred)
+        !matches!(self, Setting::Starred | Setting::Unstarred | Setting::Accepted)
+    }
+
+    /// Why this cannot apply to `item`, where it cannot: only an item another
+    /// project sent is accepted.
+    pub fn refused_on(self, item: &Item) -> Option<String> {
+        (self == Setting::Accepted && item.received.is_none()).then(|| {
+            format!(
+                "{} was not received from another project, so there is nothing to accept: accepted settles a task or a note \
+                 a session of another project created on this board",
+                item.id
+            )
+        })
     }
 
     /// Applies this to an item. A task's state goes through `State::after`
@@ -1447,6 +1498,13 @@ impl Setting {
             Setting::Undone => Change::Undo,
             Setting::Starred | Setting::Unstarred => {
                 item.is_starred = self == Setting::Starred;
+                return;
+            }
+            // Once: accepting again keeps when it was first accepted.
+            Setting::Accepted => {
+                if let Some(received) = item.received.as_mut() {
+                    received.accepted.get_or_insert_with(|| Local::now().timestamp_millis());
+                }
                 return;
             }
         };
@@ -2075,7 +2133,7 @@ mod tests {
         checked.sort();
         let expected = [
             "AgentsSettings", "Aid", "Allowance", "Anchor", "Answer", "Approving", "Artifact", "Baseline", "Born", "Comment", "Counters", "Cue", "Earlier", "Failure", "Holder",
-            "Item", "Linking", "Moved", "NamedTask", "Offered", "OnUser", "Over", "Proposal", "Question", "Quote", "Refused", "Registered", "Registry", "RestsOn", "Review", "Seen",
+            "Item", "Linking", "Moved", "NamedTask", "Offered", "OnUser", "Over", "Proposal", "Question", "Quote", "Received", "Refused", "Registered", "Registry", "RestsOn", "Review", "Seen",
             "State", "Step", "StillTrue", "Unread", "Use", "Used", "Wait", "Waiting",
         ];
         assert_eq!(checked, expected, "the scan finds the structs it should");

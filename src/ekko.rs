@@ -706,6 +706,7 @@ impl Outcome {
                         Setting::Become(State::Pending) => out.mark_reset(ids, reopened),
                         Setting::Starred => out.mark_starred(ids),
                         Setting::Unstarred => out.mark_unstarred(ids),
+                        Setting::Accepted => out.mark_accepted(ids),
                     }
                 }
             }
@@ -1159,6 +1160,9 @@ impl Ekko {
                 }
                 "due" => data.retain(|_, item| item.due_date.is_some()),
                 "artifact" | "artifacts" => data.retain(|_, item| item.artifact.is_some()),
+                // Sent by a session of another project (task 2258), settled
+                // here or not.
+                "received" => data.retain(|_, item| item.received.is_some()),
                 // `data` holds the stash only when `list_by_attributes` was
                 // given this term: every other view leaves it out.
                 STASHED => data.retain(|_, item| item.stashed.is_some()),
@@ -2375,6 +2379,10 @@ impl Ekko {
             }
         }
 
+        if let Some(why) = settings.iter().find_map(|setting| ids.iter().find_map(|id| setting.refused_on(data.get(id)?))) {
+            return Err(EkkoError::InvalidInput(why));
+        }
+
         let before = data.clone();
         for id in &ids {
             if let Some(item) = data.get_mut(id) {
@@ -3277,6 +3285,7 @@ pub(crate) fn is_known_attribute(term: &str) -> bool {
             | "overdue"
             | "artifact"
             | "artifacts"
+            | "received"
     ) || Knowledge::from_word(term).is_some()
         || term.starts_with(WITH)
         || term.starts_with(BY)
@@ -4539,6 +4548,10 @@ mod tests {
     fn every_settable_state_reports_what_it_did() {
         let (ekko, dir) = fresh_ekko();
         ekko.create_task(&words(&["a task to move through every state"])).unwrap();
+        // Sent from another project, so accepted applies to it too.
+        let mut data = ekko.storage.get().unwrap();
+        data.get_mut(&1).unwrap().received = Some(Box::new(crate::item::Received::new("graff")));
+        ekko.storage.set(&data).unwrap();
 
         for state in Setting::ALL.map(Setting::word) {
             let outcome = ekko.set_state(&words(&["@1", state]), false).unwrap();

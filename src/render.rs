@@ -1189,6 +1189,10 @@ impl<'a> Renderer<'a> {
         self.mark("Unstarred", "items", "item", ids);
     }
 
+    pub fn mark_accepted(&mut self, ids: &[u32]) {
+        self.mark("Accepted", "items", "item", ids);
+    }
+
     pub fn success_create(&mut self, item: &Item) {
         let kind = if item.is_task { "task:" } else { "note:" };
         let message = format!("Created {kind}");

@@ -1350,6 +1350,12 @@ impl<'a> Draft<'a> {
         Ok(id)
     }
 
+    /// Marks `id`, just created, as received from `from` (task 2258): a
+    /// session of that project created it on this board.
+    pub fn receive(&mut self, id: u32, from: &str) {
+        self.item(id).received = Some(Box::new(crate::item::Received::new(from)));
+    }
+
     /// Asks the user `text`: a note that waits for an answer, attached to the
     /// task it is about, if any, and carrying the session that asked and the
     /// board's revision.
@@ -2039,6 +2045,9 @@ impl<'a> Draft<'a> {
                     "{note} is a note, and a note has no state; of the states only starred and unstarred apply to it"
                 )));
             }
+        }
+        if let Some(why) = ids.iter().find_map(|id| setting.refused_on(&self.data[id])) {
+            return Err(invalid(why));
         }
         for id in &ids {
             // undone reopens only done work, so on a cancelled task it is a

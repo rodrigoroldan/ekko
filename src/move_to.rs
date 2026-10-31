@@ -341,6 +341,8 @@ pub(crate) fn references(item: &Item) -> Vec<(&'static str, &str)> {
         // The tasks a handoff names, by uid: dropped as it arrives
         // (`arriving`), so none of them needs to go with it.
         baseline: _,
+        // A project's name and a time: no item.
+        received: _,
     } = item;
     let mut found: Vec<(&'static str, &str)> = Vec::new();
     found.extend(blocked_by.iter().flatten().map(|uid| ("is blocked by", uid.as_str())));
@@ -412,6 +414,8 @@ fn arriving(item: &Item, id: u32) -> Item {
         knowledge,
         priority,
         unknown,
+        // Where it came from stays true wherever it goes.
+        received,
         // Read against the folder of the board it leaves; a write there that
         // changes its text reads it again against that board's.
         rests_on,
@@ -524,6 +528,7 @@ fn arriving(item: &Item, id: u32) -> Item {
         unknown: unknown.clone(),
         rests_on: rests_on.clone(),
         baseline: None,
+        received: received.clone(),
         phase: phase.clone(),
         blocked_by: blocked_by.clone(),
         attached_to: attached_to.clone(),
@@ -1025,6 +1030,7 @@ mod tests {
         value["cue"] = json!({"command": "cargo", "words": ["fmt"], "question": "q", "at": 22});
         value["restsOn"] = json!({"at": 24, "by": holder, "anchors": [{"path": "src/a.rs", "words": "fn a", "held": true, "line": 3}], "unread": [{"text": "x", "why": "y"}]});
         value["baseline"] = json!({"at": 25, "repository": true, "commit": "c0ffee", "branch": "main", "tasks": [{"uid": "t", "closed": true}]});
+        value["received"] = json!({"from": "graff", "accepted": 26});
         let item: Item = serde_json::from_value(value).unwrap();
         assert_eq!(item.unknown.keys().collect::<Vec<_>>(), ["a later field"], "every other key is a field");
         assert!(item.question.as_ref().unwrap().unknown.is_empty(), "every key of the question is a field");
@@ -1034,6 +1040,7 @@ mod tests {
         assert!(rests.unknown.is_empty() && rests.anchors[0].unknown.is_empty() && rests.unread[0].unknown.is_empty(), "every key of what it rests on is a field");
         let baseline = item.baseline.as_ref().unwrap();
         assert!(baseline.unknown.is_empty() && baseline.tasks[0].unknown.is_empty(), "every key of what it was written against is a field");
+        assert!(item.received.as_ref().unwrap().unknown.is_empty(), "every key of where it came from is a field");
 
         let arrived = arriving(&item, 99);
         let board_s = |item: &Item| {

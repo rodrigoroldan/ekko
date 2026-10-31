@@ -106,6 +106,14 @@ const WITH_HEADING: &str = "With someone, not to take up";
 const WITH_REST: &str = "search with a with:NAME filter";
 /// Tasks with someone `next` names before it counts the rest.
 const WITH_NAMED: usize = 20;
+/// The heading of what sessions of other projects created on this board and
+/// it has not settled (task 2258), where the rest of it is, how many a cut
+/// prime keeps, and how a session settles one with the user.
+const RECEIVED_HEADING: &str = "Received from other projects, to weigh with the user";
+const RECEIVED_REST: &str = "search with the received filter";
+const RECEIVED_KEPT: usize = 5;
+const RECEIVED_HOW: &str =
+    "A received item joins this board's work once the user agrees: set_state accepted; or cancelled, with a note why.";
 /// Decisions, gotchas and procedures a prime lists, each by its first line:
 /// the `KNOWLEDGE_CITED` that other items cite most, then the newest gotchas
 /// and procedures. Measured on the sessions of 2026-09-15 to 10-01 (task
@@ -471,6 +479,10 @@ pub struct Entry {
     /// recheck it, read now (task 1325); see `Reader::recheck`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recheck: Vec<String>,
+    /// Where it came from, when a session of another project created it
+    /// here (task 2258): that project, and whose session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub received: Option<String>,
     /// Notes attached to this task.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<NoteRef>,
@@ -748,6 +760,12 @@ impl<'a> Reader<'a> {
                 let sequence = self.sequence(item.id);
                 sequence.iter().position(|id| *id == item.id).map(|at| (at + 1, sequence.len()))
             },
+            received: item.received.as_ref().map(|received| {
+                match item.created_by.as_ref().and_then(|by| by.profile.as_deref()) {
+                    Some(profile) => format!("{} by {profile}", received.from),
+                    None => received.from.clone(),
+                }
+            }),
         }
     }
 
@@ -800,7 +818,7 @@ impl<'a> Reader<'a> {
             .graph
             .all
             .values()
-            .filter(|item| item.with.is_some() && State::of(item) != Some(State::Progress) && self.ready(item))
+            .filter(|item| item.with.is_some() && State::of(item) != Some(State::Progress) && self.ready(item) && !unsettled(item))
             .collect();
         with.sort_by_cached_key(|item| {
             let name = item.with.as_deref().map(crate::lexical::folded);
@@ -830,7 +848,7 @@ impl<'a> Reader<'a> {
             .values()
             .filter(|item| {
                 visible(item)
-                    && (State::of(item) == Some(State::Progress) || (self.ready(item) && item.with.is_none()))
+                    && (State::of(item) == Some(State::Progress) || (self.ready(item) && item.with.is_none() && !unsettled(item)))
             })
             .map(|item| (urgency(item, inherited.get(&item.id).copied(), today, now.timestamp_millis()), item))
             .collect();
@@ -863,6 +881,17 @@ impl<'a> Reader<'a> {
 
 fn visible(item: &Item) -> bool {
     item.stashed.is_none() && item.trashed.is_none()
+}
+
+/// Whether `item` came from another project (task 2258) and this board has
+/// not settled it: not accepted, and a note, or a task still as it arrived,
+/// pending. The prime lists it apart, and it is no work to take up until a
+/// session here settles it with the user -- accepted, cancelled, or taken
+/// up.
+pub fn unsettled(item: &Item) -> bool {
+    visible(item)
+        && item.received.as_ref().is_some_and(|received| received.accepted.is_none())
+        && (!item.is_task || State::of(item) == Some(State::Pending))
 }
 
 fn updated(item: &Item) -> i64 {
@@ -1072,6 +1101,13 @@ pub struct Prime {
     pub with_someone: Vec<Entry>,
     #[serde(skip_serializing_if = "is_zero")]
     pub with_someone_total: usize,
+    /// The first items sessions of other projects created here that this
+    /// board has not settled (task 2258), in the order they came;
+    /// `received_total` counts them all. Absent where there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub received: Vec<Entry>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub received_total: usize,
     pub recent_notes: Vec<NoteRef>,
     /// Done tasks still waiting on open work, as (task, blocker) pairs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1374,7 +1410,7 @@ pub fn prime(ekko: &Ekko, board: &str) -> Result<Prime, EkkoError> {
     let mut blocked: Vec<&Item> = all
         .values()
         .filter(|item| visible(item) && holds(item) && !matches!(State::of(item), Some(State::Progress | State::Waiting)))
-        .filter(|item| item.artifact.is_none())
+        .filter(|item| item.artifact.is_none() && !unsettled(item))
         .filter(|item| !reader.graph.open_blockers(item.id).is_empty())
         .collect();
     blocked.sort_by_key(|item| (std::cmp::Reverse(item.priority.unwrap_or(1)), item.id));
@@ -1399,6 +1435,14 @@ pub fn prime(ekko: &Ekko, board: &str) -> Result<Prime, EkkoError> {
     let with_someone_total = with_someone.len();
     let mut with_someone: Vec<Entry> =
         with_someone.into_iter().take(BLOCKED_SHOWN).map(|item| reader.entry(item)).collect();
+
+    // Sent by sessions of other projects and not yet settled here (task
+    // 2258): listed apart, in the order they came, for a session to weigh
+    // with the user -- a request, never work to take up unasked.
+    let mut received: Vec<&Item> = all.values().filter(|item| unsettled(item)).collect();
+    received.sort_by_key(|item| (item.timestamp, item.id));
+    let received_total = received.len();
+    let received: Vec<Entry> = received.into_iter().take(BLOCKED_SHOWN).map(|item| reader.entry(item)).collect();
 
     // Where the last session stopped, shown once in its own section rather
     // than clipped again among the notes of its task. With several sessions
@@ -1604,6 +1648,8 @@ pub fn prime(ekko: &Ekko, board: &str) -> Result<Prime, EkkoError> {
         waiting_total,
         with_someone,
         with_someone_total,
+        received,
+        received_total,
         recent_notes,
         broken: broken_dependencies(&all).into_iter().collect(),
         inversions,
@@ -3015,6 +3061,9 @@ fn listed_line(entry: &Entry, body: &str, stated: bool, today: &str) -> String {
     if let Some(with) = &entry.with {
         meta.push(format!("with {with}"));
     }
+    if let Some(from) = &entry.received {
+        meta.push(format!("from {from}"));
+    }
     if let Some((step, of)) = entry.step {
         meta.push(format!("step {step} of {of}"));
     }
@@ -3185,7 +3234,8 @@ impl Prime {
 
         let attention = self.attention();
         let recheck_how = if self.rechecks() { format!("\n{RECHECK_HOW}") } else { String::new() };
-        let close = format!("{recheck_how}\nAn item in full, with its dependencies and notes: context <id>.\n");
+        let received_how = if self.received_total > 0 { format!("\n{RECEIVED_HOW}") } else { String::new() };
+        let close = format!("{recheck_how}{received_how}\nAn item in full, with its dependencies and notes: context <id>.\n");
         // Only a board with typed notes pays for them: without any, this costs
         // nothing and the prime is what it was before they existed.
         let knowledge_more = if self.knowledge.is_empty() {
@@ -3250,6 +3300,7 @@ impl Prime {
                 kept: ARTIFACTS_KEPT,
                 reserved: false,
             },
+            Section::of_entries(RECEIVED_HEADING, &self.received, 0, self.received_total, RECEIVED_REST, RECEIVED_KEPT, &today),
             Section::of_entries("Ready, best first", &self.ready, READY_WITH_NOTES, self.ready.len(), "next lists them", READY_KEPT, &today),
             Section::of_entries("Blocked", &self.blocked, 0, self.blocked_total, "search with the blocked filter", BLOCKED_KEPT, &today),
             Section::of_entries("Waiting", &self.waiting, 0, self.waiting_total, "search with the waiting filter", WAITING_KEPT, &today),
@@ -4343,6 +4394,46 @@ mod tests {
         assert_eq!(line_ids(section), vec![2, 3], "{text}");
         assert!(section.contains("\u{21e0} 1"), "a waiting task still names its blocker: {text}");
         assert!(text.contains("2 waiting \u{b7} 1 pending"), "{text}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What sessions of other projects created here (task 2258) is listed
+    /// apart until it is settled, and in no list of work meanwhile: a
+    /// pending task, ready, blocked or with someone, and a note, each as
+    /// received; not one accepted, taken up, cancelled or trashed. Accepted,
+    /// a task joins the work it would have been in.
+    #[test]
+    fn what_another_project_sent_is_listed_apart_until_it_is_settled() {
+        let (ekko, dir) = board("received");
+        for task in ["ours", "sent, ready", "sent, blocked", "sent, with ana", "sent, accepted", "sent, under way", "sent, dropped", "sent, trashed"] {
+            ekko.create_task(&words(&[task])).unwrap();
+        }
+        ekko.create_note(&words(&["a note sent"])).unwrap();
+        let mut data = ekko.storage.get().unwrap();
+        for id in 2..=9 {
+            data.get_mut(&id).unwrap().received = Some(Box::new(crate::item::Received::new("graff")));
+        }
+        data.get_mut(&3).unwrap().blocked_by = Some(vec![data[&1].uid.clone().unwrap()]);
+        data.get_mut(&4).unwrap().with = Some("ana".into());
+        data.get_mut(&8).unwrap().trashed = Some(chrono::Local::now().timestamp_millis());
+        ekko.storage.set(&data).unwrap();
+        ekko.set_state(&words(&["@5", "accepted"]), false).unwrap();
+        ekko.set_state(&words(&["@6", "progress"]), false).unwrap();
+        ekko.set_state(&words(&["@7", "cancelled"]), false).unwrap();
+
+        let view = prime(&ekko, "default board").unwrap();
+        assert_eq!((ids(&view.received), view.received_total), (vec![2, 3, 4, 9], 4));
+        assert_eq!((ids(&view.doing), ids(&view.ready), ids(&view.blocked), ids(&view.with_someone)), (vec![6], vec![1, 5], vec![], vec![]));
+        let text = view.text();
+        let section = text.split(&format!("\n{RECEIVED_HEADING} (4)\n")).nth(1).expect("a section").split("\n\n").next().unwrap();
+        assert_eq!(line_ids(section), vec![2, 3, 4, 9], "{text}");
+        assert!(section.contains("   4. sent, with ana \u{b7} with ana \u{b7} from graff"), "{text}");
+        assert!(text.contains(RECEIVED_HOW), "{text}");
+
+        ekko.set_state(&words(&["@3", "@4", "accepted"]), false).unwrap();
+        let view = prime(&ekko, "default board").unwrap();
+        assert_eq!((ids(&view.received), ids(&view.blocked), ids(&view.with_someone)), (vec![2, 9], vec![3], vec![4]));
 
         std::fs::remove_dir_all(&dir).ok();
     }

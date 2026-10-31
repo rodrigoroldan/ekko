@@ -770,9 +770,16 @@ $ ekko --unlink-project graff                  # in either folder
 
 - **Only the user makes a link.** `--link-project` from inside a Claude Code session is refused, `!` commands included. A session proposes one instead, with `ask` and `link_project`, and only the first of its two answers, given in Ekko's menu, makes it; a session's own answer to that question is refused, as for a cue. Taking a link away is anyone's.
 - **Both ways, one record.** A link joins two projects by their ids in `~/.ekko/projects.json`, so it survives a rename or a move, and leaves with either project when it is destroyed or forgotten. It is not passed on: linking A to B and B to C does not link A to C.
-- **The tools name the linked boards.** On a board with links, every tool takes `project`, whose schema lists the linked names, and the server tells the client its tools changed when a link is made or taken away. A `wait` with `project` is kept on that board, beside its item, and told as one on the session's own board, each line naming the board: the plugin watches the file of every board linked to the session's when the session starts, so one started before the link is told in its next ekko reply. On a board without links the tools are what they were.
+- **The tools name the linked boards.** On a board with links, every tool takes `project` -- search, context and create any project's name, as the next section says, and the rest only the linked ones, which their schema lists -- and the server tells the client its tools changed when a link is made or taken away. A `wait` with `project` is kept on that board, beside its item, and told as one on the session's own board, each line naming the board: the plugin watches the file of every board linked to the session's when the session starts, so one started before the link is told in its next ekko reply. On a board without links, only search, context and create take `project`.
 - **Nothing of a linked board enters a session unasked.** The prime names the linked boards on one line, and none of their items. `ask` with `project` puts its questions on that board, in a menu opened on it, and a write there is the session's, as on its own board.
 - **Only projects link.** The default board and a board opened through `EKKO_DIR` are not registered projects, and link to none.
+
+#### Reading and leaving tasks on another project's board
+
+Without a link, a Claude Code session still reaches any project's board in two ways, through Ekko's MCP and with no prompt (task 2258): it reads it, and it leaves it a task or a note. A session on ekko that finds a defect in graff searches graff's board for it, and files it there if it is not.
+
+- **The tools.** `search` and `context` take `project`, any project's name, and read that board without writing it; their answer opens with a line saying it is that project's board, not the session's, so none of it is taken for the session's own work. `create` with `project` leaves a task or a note there, never a handoff, decision, gotcha or procedure, and its reply names only what it made. `projects` lists each project's name and folder, nothing of its items. Every other tool takes only a linked project's name, as before, and refuses another's.
+- **What arrives is received.** The item records where it came from (`received`, the sending project's name, or `default board`), beside who wrote it. That board's prime lists it under *Received from other projects, to weigh with the user* -- a request, the way Linear's Triage holds the issues others send a team -- and in no list of work, ready, blocked or with someone, until a session there settles it with the user: `--set @N accepted` (or `set_state accepted`) adds it to the board's work, `cancelled` with a note says why not, and taking it up settles it too. Only a received item can be accepted. `--list received` and the `received` search filter find what came in, settled or not.
 
 #### Moving items to another project
 
@@ -1131,7 +1138,7 @@ $ ekko --set @3 done
 $ ekko --set @1 @2 progress starred
 ```
 
-Accepted states, with their aliases: `done`/`checked`/`complete`, `undone`/`unchecked`/`incomplete`/`pending`, `progress`/`started`/`begun`, `paused`, `waiting`, `cancelled`/`cancel`/`canceled`, `unstarted`/`unstart`, `starred`/`star`, `unstarred`/`unstar`. They are the same words `--list` filters on, so there is one vocabulary rather than two. An unrecognised state is an error (`UNKNOWN_STATE`), not a silent no-op.
+Accepted states, with their aliases: `done`/`checked`/`complete`, `undone`/`unchecked`/`incomplete`/`pending`, `progress`/`started`/`begun`, `paused`, `waiting`, `cancelled`/`cancel`/`canceled`, `unstarted`/`unstart`, `starred`/`star`, `unstarred`/`unstar`, `accepted`/`accept` (an item received from another project, which then joins the board's work). They are the same words `--list` filters on, so there is one vocabulary rather than two. An unrecognised state is an error (`UNKNOWN_STATE`), not a silent no-op.
 
 Task-only states are ignored on notes, matching how `--check` already ignores them; starring applies to both.
 

@@ -128,7 +128,7 @@ fn a_legacy_client_initializes_lists_tools_and_writes_through_them() {
     assert!(init["instructions"].as_str().is_some_and(|s| s.contains("shared with the user")));
 
     let tools = replies["2"]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 23);
     // The five nearly every session calls, and ask, load at session start; the rest stay behind ToolSearch.
     let loaded: Vec<&str> =
         tools.iter().filter(|tool| tool["_meta"]["anthropic/alwaysLoad"] == true).map(|tool| tool["name"].as_str().unwrap()).collect();
@@ -1625,13 +1625,18 @@ fn a_modern_client_hears_of_changes_on_the_stream_it_opened() {
     fs::remove_dir_all(&home).ok();
 }
 
-/// A session works on its own board (task 697), and on none other the user
-/// has not linked to it (task 811): on a board without links no tool or
-/// prompt takes project, no tool lists the other projects, and every tool
-/// the server lists -- so one added later too -- refuses a call that names
-/// another project with the rule, before reading or writing either board.
+/// A session works on its own board (task 697), on those the user linked to
+/// it (task 811), and on no other but as decision 2277 settled (task 2258).
+/// Every tool but search, context, create and projects refuses a call that
+/// names another project, with the rule, before reading or writing either
+/// board, and create there makes only a task or a note. Then: projects names
+/// each project and its folder, nothing of its items; search and context
+/// read the other board, marked as another project's; a task created there
+/// is received -- its reply names only what it made, and that board's prime
+/// lists it apart, with where it came from and out of its ready work, until
+/// the user accepts it there, which only a received item can be.
 #[test]
-fn no_tool_reaches_another_projects_board() {
+fn another_projects_board_is_read_and_given_a_task_or_a_note_and_nothing_more() {
     let home = temp_home();
     let other = home.join("other");
     fs::create_dir_all(&other).unwrap();
@@ -1652,31 +1657,71 @@ fn no_tool_reaches_another_projects_board() {
     let listed = session(&home, &lines);
     let tools = listed["2"]["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
-    assert!(names.len() > 15 && !names.contains(&"projects"), "{names:?}");
+    assert!(names.len() > 15 && names.contains(&"projects"), "{names:?}");
+    const REACHING: [&str; 3] = ["context", "search", "create"];
     for tool in tools {
-        assert!(tool["inputSchema"]["properties"].get("project").is_none(), "{} takes project", tool["name"]);
+        let project = tool["inputSchema"]["properties"].get("project");
+        assert_eq!(project.is_some(), REACHING.contains(&tool["name"].as_str().unwrap()), "{}: {project:?}", tool["name"]);
     }
     for prompt in listed["3"]["result"]["prompts"].as_array().unwrap() {
         assert!(!prompt["arguments"].to_string().contains("\"project\""), "{prompt}");
     }
 
+    // The refusals first.
+    let refusing: Vec<&str> = names.iter().copied().filter(|name| !REACHING.contains(name) && *name != "projects").collect();
     let first = 10;
-    lines.extend(names.iter().zip(first..).map(|(name, id)| call(id, name, json!({"project": "other"}))));
-    lines.push(call(99, "projects", json!({})));
-    lines.push(call(100, "search", json!({"text": "secret"})));
+    lines.push(call(4, "create", json!({"text": "a task of this session's board"})));
+    lines.extend(refusing.iter().zip(first..).map(|(name, id)| call(id, name, json!({"project": "other"}))));
+    lines.push(call(90, "create", json!({"kind": "gotcha", "text": "a trap of ours", "project": "other"})));
+    lines.push(call(91, "create", json!({"kind": "handoff", "text": "where we stopped", "attached_to": 1, "project": "other"})));
+    lines.push(call(92, "set_state", json!({"items": [1], "state": "accepted"})));
+    lines.push(call(93, "projects", json!({})));
+    lines.push(call(94, "search", json!({"text": "secret", "project": "other"})));
+    lines.push(call(95, "context", json!({"item": 1, "project": "other"})));
+    lines.push(call(96, "create", json!({"text": "Fix the other project's parser", "project": "other"})));
+    lines.push(call(97, "search", json!({"text": "secret"})));
     let replies = session(&home, &lines);
-    for (name, id) in names.iter().zip(first..) {
+    for (name, id) in refusing.iter().zip(first..) {
         let reply = &replies[&id.to_string()];
         assert_eq!(reply["result"]["isError"], true, "{name}: {reply}");
         let rule = "INVALID_INPUT: other is not linked to this session's board: this session's board is not a project's, and links to none. A session works on its own board";
         assert!(text(reply).starts_with(rule), "{name}: {}", text(reply));
     }
-    assert!(replies["99"]["error"]["message"].as_str().unwrap().contains("Unknown tool: projects"), "{}", replies["99"]);
-    let searched = text(&replies["100"]);
-    assert!(!searched.contains("secret"), "the session's board holds the other project's task: {searched}");
-    let own = common::ekko().arg("--list").current_dir(&other).env("HOME", &home).output().unwrap();
-    let own = String::from_utf8(own.stdout).unwrap();
-    assert!(own.contains("a secret of the other project") && own.lines().filter(|line| line.contains("secret")).count() == 1, "the other board changed: {own}");
+    for id in ["90", "91"] {
+        assert!(text(&replies[id]).starts_with("INVALID_INPUT: create gives another project's board only a task or a note"), "{}", text(&replies[id]));
+    }
+    assert!(text(&replies["92"]).contains("1 was not received from another project"), "{}", text(&replies["92"]));
+
+    let projects = text(&replies["93"]);
+    assert!(projects.contains(&format!("  other -- {}\n", other.display())) && !projects.contains("secret"), "{projects}");
+    let mark = "From project other's board, not this session's: it answers the user's question, and none of it is work for this session.\n";
+    for id in ["94", "95"] {
+        let read = text(&replies[id]);
+        assert!(read.starts_with(mark) && read.contains("a secret of the other project"), "{read}");
+    }
+    let created: Value = serde_json::from_str(text(&replies["96"])).unwrap();
+    assert_eq!(created["items"][0]["id"], 2, "{created}");
+    assert_eq!(created.as_object().unwrap().keys().collect::<Vec<_>>(), ["ok", "items", "notices"], "{created}");
+    assert!(created["notices"][0].as_str().unwrap().starts_with("Created on project other's board, not this session's, as 2 there"), "{created}");
+    assert!(!text(&replies["97"]).contains("secret"), "the session's board holds the other project's task: {}", text(&replies["97"]));
+
+    // The other board: the task as received, listed apart until accepted.
+    let exported: Value = serde_json::from_str(&cli_in(&home, &other, &["--export"])).unwrap();
+    let task = &exported["2"];
+    assert_eq!(task["received"], json!({"from": "default board"}), "{task}");
+    let primed = cli_in(&home, &other, &["--prime"]);
+    let received = primed.split("\nReceived from other projects, to weigh with the user (1)\n").nth(1).unwrap_or_else(|| panic!("{primed}"));
+    let line = received.lines().next().unwrap();
+    assert!(line.starts_with("   2. Fix the other project's parser") && line.contains("from default board"), "{primed}");
+    assert!(primed.contains("\nReady, best first (1)\n") && primed.contains("set_state accepted"), "{primed}");
+    let refused = common::ekko().args(["--set", "@1", "accepted"]).current_dir(&other).env("HOME", &home).output().unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&refused.stdout), String::from_utf8_lossy(&refused.stderr));
+    assert!(!refused.status.success() && said.contains("1 was not received from another project"), "{said}");
+    cli_in(&home, &other, &["--set", "@2", "accepted"]);
+    let accepted = cli_in(&home, &other, &["--prime"]);
+    assert!(!accepted.contains("Received from other projects") && accepted.contains("\nReady, best first (2)\n"), "{accepted}");
+    let own = cli_in(&home, &other, &["--list"]);
+    assert_eq!(own.lines().filter(|line| line.contains("secret") || line.contains("parser")).count(), 2, "the other board changed otherwise: {own}");
 
     fs::remove_dir_all(&home).ok();
 }
@@ -1707,19 +1752,26 @@ fn projects(home: &PathBuf, names: &[&str]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The tools of a tools/list reply that take project, with its schema.
-fn taking_project(reply: &Value) -> Vec<(String, Value)> {
+/// The tools of a tools/list reply that take a linked project, by the names
+/// their project lists, with its schema: not search, context and create,
+/// whose project takes any project's name (task 2258).
+fn taking_linked(reply: &Value) -> Vec<(String, Value)> {
     let tools = reply["result"]["tools"].as_array().unwrap();
-    tools.iter().filter_map(|tool| Some((tool["name"].as_str()?.to_string(), tool["inputSchema"]["properties"].get("project")?.clone()))).collect()
+    tools
+        .iter()
+        .filter_map(|tool| Some((tool["name"].as_str()?.to_string(), tool["inputSchema"]["properties"].get("project")?.clone())))
+        .filter(|(_, project)| project.get("enum").is_some())
+        .collect()
 }
 
 /// A session reaches the boards the user linked to its own, and only those
 /// (task 811). Before the link, a call naming the other project is refused
-/// and no tool takes project. Once the user links the two in a terminal,
-/// every tool works on the other board with project -- reads and
+/// and no tool takes a linked project. Once the user links the two in a
+/// terminal, every tool works on the other board with project -- reads and
 /// writes, both ways, with no prompt -- and the tools and the prime name
 /// it; a project not linked is still refused. Taken away again, from
-/// either side, it is refused as before.
+/// either side, it is refused as before. (Search, context and create reach
+/// any project without a link, as received: task 2258.)
 #[test]
 fn a_session_reaches_the_board_the_user_linked_and_no_other() {
     let home = temp_home();
@@ -1732,8 +1784,8 @@ fn a_session_reaches_the_board_the_user_linked_and_no_other() {
     ];
     let with = |calls: Vec<String>| listing.iter().cloned().chain(calls).collect::<Vec<_>>();
 
-    let before = session_in(&home, site, &with(vec![call(3, "search", json!({"text": "blog", "project": "blog"}))]));
-    assert!(taking_project(&before["2"]).is_empty());
+    let before = session_in(&home, site, &with(vec![call(3, "next", json!({"project": "blog"}))]));
+    assert!(taking_linked(&before["2"]).is_empty());
     assert!(
         text(&before["3"]).starts_with("INVALID_INPUT: blog is not linked to this session's board: no board is linked to this session's."),
         "{}",
@@ -1755,12 +1807,12 @@ fn a_session_reaches_the_board_the_user_linked_and_no_other() {
             call(5, "prime", json!({"project": "blog"})),
             call(6, "prime", json!({})),
             call(7, "wait", json!({"item": 1, "until": "done", "text": "carry on", "project": "blog"})),
-            call(8, "search", json!({"text": "blog", "project": "shop"})),
+            call(8, "next", json!({"project": "shop"})),
             call(9, "search", json!({"text": "written"})),
         ]),
     );
-    let tools = taking_project(&linked["2"]);
-    assert_eq!(tools.len(), linked["2"]["result"]["tools"].as_array().unwrap().len(), "every tool: {tools:?}");
+    let tools = taking_linked(&linked["2"]);
+    assert_eq!(tools.len(), linked["2"]["result"]["tools"].as_array().unwrap().len() - 4, "every tool but context, search, create and projects: {tools:?}");
     assert!(tools.iter().all(|(_, project)| project["enum"] == json!(["blog"])), "{tools:?}");
     assert!(text(&linked["3"]).contains("a task of the blog"), "{}", text(&linked["3"]));
     assert!(text(&linked["10"]).starts_with("ekko \u{b7} project blog"), "{}", text(&linked["10"]));
@@ -1780,12 +1832,12 @@ fn a_session_reaches_the_board_the_user_linked_and_no_other() {
 
     let back = session_in(&home, blog, &with(vec![call(3, "create", json!({"text": "written from the blog's session", "project": "site"}))]));
     assert_eq!(back["3"]["result"]["isError"], false, "{}", text(&back["3"]));
-    assert_eq!(taking_project(&back["2"])[0].1["enum"], json!(["site"]));
+    assert_eq!(taking_linked(&back["2"])[0].1["enum"], json!(["site"]));
     assert!(cli_in(&home, site, &["--list"]).contains("written from the blog's session"));
 
     assert!(cli_in(&home, blog, &["--unlink-project", "site"]).contains("Unlinked projects:"));
-    let after = session_in(&home, site, &with(vec![call(3, "search", json!({"text": "blog", "project": "blog"}))]));
-    assert!(taking_project(&after["2"]).is_empty());
+    let after = session_in(&home, site, &with(vec![call(3, "next", json!({"project": "blog"}))]));
+    assert!(taking_linked(&after["2"]).is_empty());
     assert!(text(&after["3"]).starts_with("INVALID_INPUT: blog is not linked to this session's board"), "{}", text(&after["3"]));
 
     fs::remove_dir_all(&home).ok();
@@ -2015,7 +2067,7 @@ fn a_link_ask_proposes_is_made_only_by_the_users_answer_in_ekkos_menu() {
     let answer = answer.as_str();
     let mut live = Held::start_in(&home, Some(site), answer);
     live.send(&request(2, "tools/list", json!({})));
-    assert!(taking_project(&live.reply(2)).is_empty());
+    assert!(taking_linked(&live.reply(2)).is_empty());
     live.send(&call(3, "ask", json!({"questions": [proposing(json!({"text": "E agora?", "link_project": "blog"}))]})));
     let answered: Value = serde_json::from_str(text(&live.reply(3))).unwrap();
     assert_eq!(answered["answers"][0]["answer"], APPLY, "{answered}");
@@ -2027,7 +2079,7 @@ fn a_link_ask_proposes_is_made_only_by_the_users_answer_in_ekkos_menu() {
         }
     }
     live.send(&request(4, "tools/list", json!({})));
-    assert_eq!(taking_project(&live.reply(4))[0].1["enum"], json!(["blog"]));
+    assert_eq!(taking_linked(&live.reply(4))[0].1["enum"], json!(["blog"]));
 
     live.send(&call(5, "ask", json!({"project": "blog", "questions": [{"quick": true, "text": "Qual quadro?"}]})));
     let there: Value = serde_json::from_str(text(&live.reply(5))).unwrap();
@@ -2045,7 +2097,7 @@ fn a_link_ask_proposes_is_made_only_by_the_users_answer_in_ekkos_menu() {
         }
     }
     live.send(&request(7, "tools/list", json!({})));
-    assert!(taking_project(&live.reply(7)).is_empty());
+    assert!(taking_linked(&live.reply(7)).is_empty());
     live.stop();
     let log = fs::read_to_string(home.join("terminal.log")).unwrap();
     assert!(log.lines().last().unwrap().starts_with("env -u CLAUDECODE EKKO_PROJECT=blog sh -c "), "{log}");
@@ -2061,7 +2113,7 @@ fn a_link_ask_proposes_is_made_only_by_the_users_answer_in_ekkos_menu() {
 /// -- six such rewrites cost 9.6% of the handoff era of 2026-09-21 (note 258)
 /// -- so it changes on purpose, batched into a release that changes it anyway,
 /// with this fingerprint moved alongside.
-const PREFIX_FINGERPRINT: u64 = 0x4d568769879a9a3e;
+const PREFIX_FINGERPRINT: u64 = 0xb6451b3b26767cdd;
 
 #[test]
 fn the_prefix_every_session_pays_for_changes_only_on_purpose() {

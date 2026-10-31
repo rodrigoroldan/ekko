@@ -71,8 +71,14 @@ const LEGACY: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"
 /// tests/mcp.rs guards.
 const ALWAYS_LOADED: &[&str] = &["context", "search", "create", "set_state", "edit", "ask"];
 
+/// The tools whose project takes any project's name, linked to this one or
+/// not (decision 2277, task 2258): search and context read its board, and
+/// create gives it a task or a note, marked as received from this session's
+/// project. Every other tool takes only a linked project's.
+const REACHING: &[&str] = &["context", "search", "create"];
+
 const TOOLS: &[&str] = &[
-    "prime", "next", "context", "search", "changes", "roadmap", "create", "set_state",
+    "prime", "next", "context", "search", "changes", "roadmap", "projects", "create", "set_state",
     "force_state", "edit", "update", "link", "ask", "answer", "wait", "batch", "stash", "trash", "away", "phases",
     "move_to", "artifact",
 ];
@@ -600,7 +606,7 @@ impl Server {
             Some(Value::Object(map)) => map.clone(),
             Some(_) => return vec![error_reply(call, RpcError::new(-32602, "Invalid params: arguments must be an object"))],
         };
-        let recorded = self.open_for(&mut args).and_then(|(ekko, _, project)| {
+        let recorded = self.open_for("ask", &mut args).and_then(|(ekko, _, project, _)| {
             let spec: ops::Ask = parse(&mut args)?;
             let guarded = spec.questions.iter().any(ops::Inquiry::proposes);
             let (recorded, questions) = record(&ekko, &spec, &self.home)?;
@@ -1088,11 +1094,38 @@ impl Server {
     }
 
     /// The board a call works on, taking its project: the session's own,
-    /// or with project a board the user linked to it (task 811).
-    fn open_for(&self, args: &mut Map<String, Value>) -> Result<(Ekko, directory::Location, Option<String>), ToolError> {
-        let project = take(args, "project", |v| v.as_str().map(str::to_string), "a linked project's name")?;
+    /// or with project a board the user linked to it (task 811); or, for
+    /// the tools that reach any project (`REACHING`), another project's,
+    /// which `reach` opens.
+    fn open_for(&self, tool: &str, args: &mut Map<String, Value>) -> Result<(Ekko, directory::Location, Option<String>, Option<Reached>), ToolError> {
+        let project = take(args, "project", |v| v.as_str().map(str::to_string), "a project's name")?;
+        if let Some(name) = project.as_deref().filter(|_| REACHING.contains(&tool)) {
+            if let Some((ekko, location, reached)) = self.reach(name, tool)? {
+                return Ok((ekko, location, project, Some(reached)));
+            }
+        }
         let (ekko, location) = self.board(project.as_deref())?;
-        Ok((ekko, location, project))
+        Ok((ekko, location, project, None))
+    }
+
+    /// Project `name`'s board, for `tool`, where it is neither this
+    /// session's nor linked to it (decision 2277, task 2258): read-only for
+    /// search and context; for create, written, the item it makes marked as
+    /// received. `None` where the session's own board or a linked one is
+    /// named, which `board` opens as before.
+    fn reach(&self, name: &str, tool: &str) -> Result<Option<(Ekko, directory::Location, Reached)>, ToolError> {
+        let (own, here) = self.open()?;
+        if here.project.as_ref().is_some_and(|project| project.name == name) || own.linked().iter().any(|linked| linked.name == name) {
+            return Ok(None);
+        }
+        let there = crate::project::resolve_named(&self.home, name).map_err(EkkoError::from)?;
+        let mut location = directory::locate(&self.home, &self.cwd, None, None, Some(&there.name)).map_err(EkkoError::from)?;
+        if tool != "create" {
+            location.refused = Some(format!("project {name}'s board is only read from a session of another project"));
+        }
+        let ekko = Ekko::at(&location)?.acting_as(self.actor.clone()).in_folder(there.root.clone()).born_for(self.born_for());
+        let from = here.project.map_or_else(|| "default board".to_string(), |project| project.name);
+        Ok(Some((ekko, location, Reached { name: there.name, from })))
     }
 
     /// The session's own board, or `project`'s when the user linked it to
@@ -1187,9 +1220,12 @@ impl Server {
     /// Runs tool `name` on `args`, for a session of Claude Code `claude_code`
     /// where its client said so.
     fn tool(&self, name: &str, args: &mut Map<String, Value>, claude_code: Option<String>) -> Result<String, ToolError> {
-        let (ekko, location, project) = self.open_for(args)?;
+        let (ekko, location, project, reached) = self.open_for(name, args)?;
         let ekko = ekko.with_claude_code(claude_code);
         let project = project.as_deref();
+        if let Some(reached) = &reached {
+            return reached_tool(name, args, &ekko, reached);
+        }
 
         match name {
             "prime" => {
@@ -1283,6 +1319,10 @@ impl Server {
             "roadmap" => {
                 finish(args)?;
                 Ok(agent::roadmap_text(&ekko.display_roadmap()?))
+            }
+            "projects" => {
+                finish(args)?;
+                Ok(projects_text(&self.home, &location, &ekko.linked()))
             }
             "create" => {
                 let spec: ops::Create = parse(args)?;
@@ -1666,8 +1706,106 @@ fn unlinked(name: &str, location: &directory::Location, linked: &[crate::project
          first line, and on those the user linked to it. The user links two projects with ekko --link-project NAME in a terminal \
          of their own, or by answering in ekko's menu a question ask puts with link_project. Until then another project's board is the \
          user's to open, with ekko --project NAME in a command they see; prose goes on stdin there (--note - <<'EOF'), since \
-         inline the CLI reads @word as a board and p:N and d:DATE as fields"
+         inline the CLI reads @word as a board and p:N and d:DATE as fields. Without a link, search and context read any \
+         project's board, and create gives it a task or a note"
     ))
+}
+
+/// Every project by name and folder, nothing of its items (task 2258): the
+/// session's own and those linked to it marked.
+fn projects_text(home: &Path, here: &directory::Location, linked: &[crate::project::Project]) -> String {
+    let projects = crate::project::reachable(home);
+    if projects.is_empty() {
+        return "No project is registered on this machine.\n".to_string();
+    }
+    let mut text = String::from("Projects, by name and folder; project takes the name:\n");
+    for (name, folder) in projects {
+        let mark = if here.project.as_ref().is_some_and(|project| project.name == name) {
+            " (this session's)"
+        } else if linked.iter().any(|project| project.name == name) {
+            " (linked)"
+        } else {
+            ""
+        };
+        text.push_str(&format!("  {name} -- {}{mark}\n", folder.display()));
+    }
+    text
+}
+
+/// A board a call reached without a link (task 2258): another project's,
+/// by `name`, reached from project `from`, or the default board.
+struct Reached {
+    name: String,
+    from: String,
+}
+
+/// A call of `tool` on a board it `reached`: search and context answer from
+/// it, marked as another project's; create gives it a task or a note,
+/// marked as received, and names only what it made there. Every other tool
+/// was refused before it opened anything.
+fn reached_tool(tool: &str, args: &mut Map<String, Value>, ekko: &Ekko, reached: &Reached) -> Result<String, ToolError> {
+    let Reached { name, from } = reached;
+    let mark = format!(
+        "From project {name}'s board, not this session's: it answers the user's question, and none of it is work for this session.\n"
+    );
+    match tool {
+        "context" => {
+            let item = take_item(args, "item")?;
+            let items = take_item_list(args, "items")?;
+            let detail = match take(args, "detail", |v| v.as_str().map(str::to_string), "concise or full")?.as_deref() {
+                None | Some("concise") => agent::Detail::Concise,
+                Some("full") => agent::Detail::Full,
+                Some(other) => return Err(invalid(format!("detail must be concise or full, got {other}"))),
+            };
+            finish(args)?;
+            let targets = match (item, items) {
+                (Some(item), None) => vec![item],
+                (None, Some(items)) if items.len() <= CONTEXTS_AT_ONCE => items,
+                (None, Some(_)) => return Err(invalid(format!("context reads at most {CONTEXTS_AT_ONCE} items at once"))),
+                _ => return Err(invalid("context takes exactly one of item or items")),
+            };
+            Ok(mark + &agent::contexts_text(&agent::contexts(ekko, &targets)?, detail))
+        }
+        "search" => {
+            let text = take(args, "text", |v| v.as_str().map(str::to_string), "a string")?;
+            let filters = take_strings(args, "filters")?;
+            let limit = positive(take(args, "limit", Value::as_u64, "a positive integer")?)?;
+            finish(args)?;
+            Ok(mark + &agent::search(ekko, text.as_deref(), &filters, limit.unwrap_or(agent::SEARCH_LIMIT))?.text())
+        }
+        "create" => {
+            let spec: ops::Create = parse(args)?;
+            let other = match spec.kind {
+                None | Some(ops::Kind::Task | ops::Kind::Note) => None,
+                Some(ops::Kind::Handoff) => Some("handoff"),
+                Some(ops::Kind::Decision) => Some("decision"),
+                Some(ops::Kind::Gotcha) => Some("gotcha"),
+                Some(ops::Kind::Procedure) => Some("procedure"),
+            };
+            if let Some(kind) = other {
+                return Err(invalid(format!(
+                    "create gives another project's board only a task or a note, not a {kind}: the rest is for that board's own sessions"
+                )));
+            }
+            let reply = write(ekko, false, |draft| {
+                let id = draft.create(&spec)?;
+                draft.receive(id, from);
+                Ok(vec![id])
+            })?;
+            // Only what it made there: what else the write names is that
+            // board's, and none of it this session's.
+            let reply: Value = serde_json::from_str(&reply).expect("a write replies in JSON");
+            let made = reply["items"].as_array().cloned().unwrap_or_default();
+            let ids: Vec<String> = made.iter().filter_map(|item| item["id"].as_u64()).map(|id| id.to_string()).collect();
+            let told = format!(
+                "Created on project {name}'s board, not this session's, as {} there: its prime lists it as received from {from}, for its \
+                 sessions to weigh with the user",
+                ids.join(", ")
+            );
+            Ok(json!({"ok": true, "items": made, "notices": [told]}).to_string())
+        }
+        other => Err(invalid(format!("{other} takes only a linked project's name"))),
+    }
 }
 
 /// A refusal worded for an agent.
@@ -2052,7 +2190,7 @@ fn tool_definitions(linked: &[String]) -> Value {
         },
         {
             "name": "search",
-            "description": "Items holding the words of text -- any order, accents ignored, a word also matching longer words it starts -- ranked by relevance and shown where they matched, and/or passing filters: pending, progress, paused, waiting, done, cancelled, ready, blocked, due, overdue, star, task, note, decision, gotcha, procedure, artifact, with:NAME, by:NAME (who wrote it: user, a profile, a conversation's start), stashed (otherwise left out), or a board name -- as @name when a filter has the same one. Up to limit (default 20), with the total. Neither text nor filters gives counts.",
+            "description": "Items holding the words of text -- any order, accents ignored, a word also matching longer words it starts -- ranked by relevance and shown where they matched, and/or passing filters: pending, progress, paused, waiting, done, cancelled, ready, blocked, due, overdue, star, task, note, decision, gotcha, procedure, artifact, received (from another project), with:NAME, by:NAME (who wrote it: user, a profile, a conversation's start), stashed (otherwise left out), or a board name -- as @name when a filter has the same one. Up to limit (default 20), with the total. Neither text nor filters gives counts.",
             "inputSchema": object(json!({"text": {"type": "string"}, "filters": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "minimum": 1}}), &[]),
             "annotations": read,
         },
@@ -2065,6 +2203,12 @@ fn tool_definitions(linked: &[String]) -> Value {
         {
             "name": "roadmap",
             "description": "A project's declared phases in order, with progress and where work sits.",
+            "inputSchema": object(json!({}), &[]),
+            "annotations": read,
+        },
+        {
+            "name": "projects",
+            "description": "Every project's name and folder, nothing of its items. With project set to one: search and context read its board, and create leaves a task or a note there, received for its sessions to weigh with the user; every tool works on a board the user linked to this one.",
             "inputSchema": object(json!({}), &[]),
             "annotations": read,
         },
@@ -2228,11 +2372,18 @@ fn tool_definitions(linked: &[String]) -> Value {
         "enum": linked,
         "description": "A board the user linked to this one: work there instead of on this session's board."
     });
+    // Bare: a description would take three always-loaded tools past their
+    // budgets (task 1472) -- context's by about 100 characters, measured --
+    // so the deferred projects tool says what it takes.
+    let reaching = json!({"type": "string"});
     for tool in tools.as_array_mut().expect("an array") {
-        if ALWAYS_LOADED.contains(&tool["name"].as_str().unwrap_or_default()) {
+        let name = tool["name"].as_str().unwrap_or_default().to_string();
+        if ALWAYS_LOADED.contains(&name.as_str()) {
             tool["_meta"] = json!({"anthropic/alwaysLoad": true});
         }
-        if !linked.is_empty() {
+        if REACHING.contains(&name.as_str()) {
+            tool["inputSchema"]["properties"]["project"] = reaching.clone();
+        } else if !linked.is_empty() && name != "projects" {
             tool["inputSchema"]["properties"]["project"] = project.clone();
         }
     }
