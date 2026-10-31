@@ -23,7 +23,7 @@ import sys
 
 DATABASE = "board.sqlite"
 # The layout these functions know: the database's user_version.
-LAYOUT = 1
+LAYOUT = 2
 LOGS = ("-wal", "-shm", "-journal")
 
 
@@ -153,6 +153,11 @@ def remove(board, ids):
             marks = ",".join("?" * len(ids))
             conn.execute(f"DELETE FROM items WHERE id IN ({marks})", tuple(ids))
             conn.execute(f"DELETE FROM changes WHERE id IN ({marks})", tuple(ids))
+            # Layout 2 keeps each item's words and references beside it (task 2234).
+            derived = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            for table in ("refs", "words", "lengths"):
+                if table in derived:
+                    conn.execute(f"DELETE FROM {table} WHERE item IN ({marks})", tuple(ids))
             for seq, entry in conn.execute("SELECT seq, entry FROM journal").fetchall():
                 line = json.loads(entry)
                 if any(int(named.get("id", -1)) in ids for key in ("released", "blocked", "removed") for named in line.get(key, [])):

@@ -177,6 +177,25 @@ fn count(query: &Query, text: &str, word: &mut String) -> (usize, Vec<usize>) {
     (length, counts)
 }
 
+/// The words of `text` as `count` reads them, folded, each with how often it
+/// is there, and how many words it holds in all: what the board's database
+/// keeps of each item's text, so that a search finds and ranks its
+/// candidates by query as `rank` does over their texts (task 2234).
+pub fn word_counts(text: &str) -> (usize, std::collections::BTreeMap<String, usize>) {
+    let (mut length, mut counts, mut word, mut in_word) = (0, std::collections::BTreeMap::new(), String::new(), false);
+    for c in text.chars().chain(std::iter::once(' ')) {
+        if c.is_alphanumeric() {
+            fold_char(c, &mut word);
+            in_word = true;
+        } else if in_word {
+            length += 1;
+            *counts.entry(std::mem::take(&mut word)).or_insert(0) += 1;
+            in_word = false;
+        }
+    }
+    (length, counts)
+}
+
 /// `text` on one line, cut to `window` characters around where it best
 /// matches `query`: the stretch holding the most different query words, with
 /// a short lead-in, cut at word boundaries and marked with an ellipsis on

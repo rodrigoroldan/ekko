@@ -28,7 +28,7 @@ pub const FILE: &str = "board.sqlite";
 /// `user_version`. A build writes no database of a later layout, whose
 /// writes may keep more than this one knows to keep up to date; it reads
 /// one as long as the items are where it looks for them.
-pub const LAYOUT: i64 = 1;
+pub const LAYOUT: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
@@ -38,6 +38,94 @@ CREATE TABLE changes (seq INTEGER PRIMARY KEY, rev INTEGER NOT NULL, at INTEGER 
 CREATE INDEX changes_rev ON changes(rev);
 CREATE INDEX changes_at ON changes(at);
 ";
+
+/// What layout 2 adds (task 2234): what a read finds items by, derived from
+/// each item's JSON in the transaction that writes it, the JSON staying the
+/// item. Generated columns read a field out of the JSON and are computed,
+/// not stored, so adding one rewrites no row; refs holds every uid an item
+/// names (see `references`); words and lengths hold each item's text as
+/// lexical.rs reads it, which a search ranks by.
+const DERIVED: &str = "
+ALTER TABLE items ADD COLUMN uid TEXT GENERATED ALWAYS AS (json_extract(body, '$.uid')) VIRTUAL;
+ALTER TABLE items ADD COLUMN rev INTEGER GENERATED ALWAYS AS (json_extract(body, '$.rev')) VIRTUAL;
+CREATE INDEX items_uid ON items(uid);
+CREATE INDEX items_rev ON items(rev);
+CREATE TABLE refs (item INTEGER NOT NULL, path TEXT NOT NULL, target TEXT NOT NULL);
+CREATE INDEX refs_target ON refs(target);
+CREATE INDEX refs_item ON refs(item);
+CREATE TABLE words (word TEXT NOT NULL, item INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (word, item)) WITHOUT ROWID;
+CREATE INDEX words_item ON words(item);
+CREATE TABLE lengths (item INTEGER PRIMARY KEY, words INTEGER NOT NULL);
+";
+
+/// Whether `text` has the shape `item::new_uid` gives a uid: the time in
+/// nanoseconds, 16 hex digits, a dash, then the process id in hex. A
+/// holder's conversation and boot ids are UUIDs, of another shape.
+pub fn is_uid(text: &str) -> bool {
+    let hex = |part: &str| part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    text.split_once('-').is_some_and(|(time, process)| time.len() == 16 && hex(time) && (1..=16).contains(&process.len()) && hex(process))
+}
+
+/// Every reference an item's JSON makes to another item, as (path, uid):
+/// each string value with a uid's shape, at any path but the item's own
+/// `uid`, the path with array indices left out -- "blockedBy",
+/// "artifact.steps.task". The rule is over the class, not a list of fields:
+/// a field added later that names an item by uid is a reference without a
+/// change here (task 2234).
+pub fn references(item: &Value) -> Vec<(String, String)> {
+    fn walk(value: &Value, path: &mut Vec<String>, found: &mut Vec<(String, String)>) {
+        match value {
+            Value::String(text) if is_uid(text) && !(path.len() == 1 && path[0] == "uid") => found.push((path.join("."), text.clone())),
+            Value::Array(values) => values.iter().for_each(|value| walk(value, path, found)),
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    path.push(key.clone());
+                    walk(value, path, found);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    walk(item, &mut Vec::new(), &mut found);
+    found
+}
+
+/// Puts in the derived tables what `body`, item `id`'s JSON, holds, after
+/// taking out what they held of it; `None` leaves the item out of them.
+fn derive(conn: &Connection, id: u32, body: Option<&str>) -> Result<(), StorageError> {
+    for table in ["DELETE FROM refs WHERE item = ?1", "DELETE FROM words WHERE item = ?1", "DELETE FROM lengths WHERE item = ?1"] {
+        conn.prepare_cached(table)?.execute([id])?;
+    }
+    let Some(body) = body else { return Ok(()) };
+    let item: Value = serde_json::from_str(body)?;
+    for (path, target) in references(&item) {
+        conn.prepare_cached("INSERT INTO refs (item, path, target) VALUES (?1, ?2, ?3)")?.execute(params![id, path, target])?;
+    }
+    let (length, counts) = crate::lexical::word_counts(item["description"].as_str().unwrap_or_default());
+    for (word, n) in counts {
+        conn.prepare_cached("INSERT INTO words (word, item, n) VALUES (?1, ?2, ?3)")?.execute(params![word, id, n as i64])?;
+    }
+    conn.prepare_cached("INSERT INTO lengths (item, words) VALUES (?1, ?2)")?.execute(params![id, length as i64])?;
+    Ok(())
+}
+
+/// Brings a database of layout 1 to this one, in the caller's transaction:
+/// the derived tables, built from every item.
+fn upgrade(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(DERIVED)?;
+    let rows: Vec<(u32, String)> = {
+        let mut statement = conn.prepare("SELECT id, body FROM items ORDER BY id")?;
+        let found = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        found.collect::<Result<_, _>>()?
+    };
+    for (id, body) in rows {
+        derive(conn, id, Some(&body))?;
+    }
+    conn.pragma_update(None, "user_version", LAYOUT)?;
+    Ok(())
+}
 
 /// How long a change is kept: the two weeks `history/` kept versions of
 /// storage.json for, so any revision of that window can be had back exactly.
@@ -117,6 +205,7 @@ impl Database {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(DERIVED)?;
         conn.pragma_update(None, "user_version", LAYOUT)?;
         Database::configured(conn)
     }
@@ -238,6 +327,11 @@ impl Database {
         if layout > LAYOUT {
             return Err(StorageError::Refused(newer(layout)));
         }
+        // Under the board's lock, as every write is: no other writer can
+        // change an item between the derived rows and this write's.
+        if layout < LAYOUT {
+            upgrade(&tx)?;
+        }
         let commits = meta_i64(&tx, "commits")? + 1;
         set_meta(&tx, "commits", commits)?;
         let mut writes = meta_i64(&tx, "writes")?;
@@ -253,6 +347,7 @@ impl Database {
                 Some(body) => tx.prepare_cached("INSERT OR REPLACE INTO items (id, body) VALUES (?1, ?2)")?.execute(params![change.id, body])?,
                 None => tx.prepare_cached("DELETE FROM items WHERE id = ?1")?.execute([change.id])?,
             };
+            derive(&tx, change.id, after.as_deref())?;
             tx.prepare_cached("INSERT INTO changes (rev, at, id, before, after) VALUES (?1, ?2, ?3, ?4, ?5)")?
                 .execute(params![write.rev as i64, write.at, change.id, before, after])?;
             changed = true;
@@ -281,7 +376,9 @@ impl Database {
         {
             let mut insert = tx.prepare_cached("INSERT INTO items (id, body) VALUES (?1, ?2)")?;
             for (id, item) in board {
-                insert.execute(params![id, serde_json::to_string(item)?])?;
+                let body = serde_json::to_string(item)?;
+                insert.execute(params![id, body])?;
+                derive(&tx, *id, Some(&body))?;
             }
         }
         for entry in journal {
@@ -518,4 +615,134 @@ fn trim_journal(conn: &Connection, bytes: u64) -> Result<(), StorageError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Every uid an item's JSON names is a reference, at any depth and under
+    /// any field, one no code reads yet included; the item's own uid, a text
+    /// holding a uid among other words and a conversation's UUID are not.
+    #[test]
+    fn references_are_every_uid_an_item_names_but_its_own() {
+        let item = json!({
+            "uid": "18e398963d9b9a63-308282",
+            "description": "18e3619e4cb27f26-279b5d says why",
+            "blockedBy": ["18e3619e4cb27f26-279b5d", "18e362aeb7d70d1f-279b5d"],
+            "attachedTo": "18e01608fa05b11c-12d6de",
+            "artifact": {"steps": [{"key": "a", "task": "18da5f41e46bb88c-75c55"}, {"key": "b"}]},
+            "createdBy": {"conversation": "50daee67-47ea-4675-8a9d-0e88400f18a5", "pid": 324206},
+            "later": {"named": [{"deep": "18e397a97fd220aa-308282"}]},
+        });
+        let mut found = references(&item);
+        found.sort();
+        let expected: Vec<(String, String)> = [
+            ("artifact.steps.task", "18da5f41e46bb88c-75c55"),
+            ("attachedTo", "18e01608fa05b11c-12d6de"),
+            ("blockedBy", "18e3619e4cb27f26-279b5d"),
+            ("blockedBy", "18e362aeb7d70d1f-279b5d"),
+            ("later.named.deep", "18e397a97fd220aa-308282"),
+        ]
+        .into_iter()
+        .map(|(path, uid)| (path.to_string(), uid.to_string()))
+        .collect();
+        assert_eq!(found, expected);
+        assert!(is_uid(&crate::item::new_uid()), "the shape is the one ekko gives a uid");
+    }
+
+    /// The derived rows, one line each, in order.
+    fn derived(conn: &Connection) -> Vec<String> {
+        let mut rows = Vec::new();
+        for query in [
+            "SELECT 'ref ' || item || ' ' || path || ' ' || target FROM refs ORDER BY 1",
+            "SELECT 'word ' || word || ' ' || item || ' ' || n FROM words ORDER BY 1",
+            "SELECT 'length ' || item || ' ' || words FROM lengths ORDER BY 1",
+        ] {
+            let mut statement = conn.prepare(query).unwrap();
+            rows.extend(statement.query_map([], |row| row.get::<_, String>(0)).unwrap().map(Result::unwrap));
+        }
+        rows
+    }
+
+    /// The derived rows as the items now in the database would make them,
+    /// built in a savepoint that is then undone.
+    fn rebuilt(conn: &Connection) -> Vec<String> {
+        conn.execute_batch("SAVEPOINT rebuild; DELETE FROM refs; DELETE FROM words; DELETE FROM lengths;").unwrap();
+        let rows: Vec<(u32, String)> = {
+            let mut statement = conn.prepare("SELECT id, body FROM items").unwrap();
+            statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().map(Result::unwrap).collect()
+        };
+        for (id, body) in rows {
+            derive(conn, id, Some(&body)).unwrap();
+        }
+        let made = derived(conn);
+        conn.execute_batch("ROLLBACK TO rebuild; RELEASE rebuild;").unwrap();
+        made
+    }
+
+    fn write(db: &mut Database, rev: u64, changes: Vec<Change<'_>>) {
+        db.write(&Write { changes, rev, at: rev as i64, journal: None, counters: None, journal_bytes: 1 << 20 }).unwrap();
+    }
+
+    /// After each kind of write -- items added, one changed, one taken out
+    /// -- the rows a read finds items by are what the items would make
+    /// again: none stale, none left behind.
+    #[test]
+    fn the_derived_rows_follow_every_write() {
+        let dir = crate::paths::test_dir("ekko-database-derived");
+        fs::create_dir_all(&dir).unwrap();
+        let mut db = Database::create(&dir.join(FILE)).unwrap();
+        let mut first = Item::new_task(1, "Parser reads tabs".into(), vec!["@a".into()], 1);
+        let second = Item::new_task(2, "Lexer, then the parser".into(), vec!["@a".into()], 1);
+        first.blocked_by = Some(vec![second.uid.clone().unwrap()]);
+
+        write(&mut db, 1, vec![Change { id: 1, after: Some(&first) }, Change { id: 2, after: Some(&second) }]);
+        let rows = derived(&db.conn);
+        assert!(rows.iter().any(|row| row.starts_with("ref 1 blockedBy ")), "{rows:?}");
+        assert!(rows.contains(&"word parser 2 1".to_string()), "{rows:?}");
+        assert_eq!(rows, rebuilt(&db.conn));
+
+        first.description = "Parser reads spaces".into();
+        first.blocked_by = None;
+        write(&mut db, 2, vec![Change { id: 1, after: Some(&first) }]);
+        assert_eq!(derived(&db.conn), rebuilt(&db.conn));
+
+        write(&mut db, 3, vec![Change { id: 2, after: None }]);
+        let rows = derived(&db.conn);
+        assert!(!rows.iter().any(|row| row.contains("lexer")), "a removed item's words stayed: {rows:?}");
+        assert_eq!(rows, rebuilt(&db.conn));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A database an ekko of layout 1 made is read as it is, and its next
+    /// write brings it to this layout, the items it held before given their
+    /// derived rows too.
+    #[test]
+    fn a_layout_1_database_is_brought_to_this_one_at_its_next_write() {
+        let dir = crate::paths::test_dir("ekko-database-upgrade");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        let before = Item::new_task(1, "Kept from before".into(), vec!["@a".into()], 1);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute("INSERT INTO items (id, body) VALUES (1, ?1)", [serde_json::to_string(&before).unwrap()]).unwrap();
+        }
+        let mut db = Database::open(&path).unwrap().unwrap();
+        assert_eq!(db.layout().unwrap(), 1);
+        assert_eq!(db.load().unwrap().1.len(), 1, "read as it is, before any write");
+
+        let now = Item::new_task(2, "Written now".into(), vec!["@a".into()], 1);
+        write(&mut db, 2, vec![Change { id: 2, after: Some(&now) }]);
+        assert_eq!(db.layout().unwrap(), LAYOUT);
+        let rows = derived(&db.conn);
+        assert!(rows.contains(&"word kept 1 1".to_string()), "the item from before has no words: {rows:?}");
+        assert_eq!(rows, rebuilt(&db.conn));
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }
