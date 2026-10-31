@@ -329,24 +329,32 @@ impl Storage {
     /// (task 2234). `None` where the board has no database of this layout
     /// yet, for the caller to read the whole board.
     pub fn working_set(&self, targets: &[String]) -> Result<Option<(Arc<ItemMap>, u64)>, StorageError> {
-        self.working_set_of(|_| Ok(targets.to_vec()))
+        self.working_set_of(false, |_| Ok(Some(targets.to_vec())))
     }
 
     /// `working_set`, its targets found in the database by `targets` -- the
-    /// items that moved since a revision, say -- only when it reads there.
+    /// items that moved since a revision, say -- only when it reads there;
+    /// `targets` gives `None` where so many are asked that the whole board
+    /// is the cheaper read, and gets it.
     #[rustfmt::skip]
-    pub fn working_set_of(&self, targets: impl FnOnce(&Database) -> Result<Vec<String>, StorageError>) -> Result<Option<(Arc<ItemMap>, u64)>, StorageError> {
+    pub fn working_set_of(&self, even_if_kept: bool, targets: impl FnOnce(&Database) -> Result<Option<Vec<String>>, StorageError>) -> Result<Option<(Arc<ItemMap>, u64)>, StorageError> {
         let mut opened = self.database.lock().unwrap_or_else(PoisonError::into_inner);
         self.open_database(&mut opened)?;
         let Some(open) = opened.as_ref() else { return Ok(None) };
-        if open.db.layout()? != database::LAYOUT {
+        if !open.db.queryable()? {
             return Ok(None);
         }
-        if let Some(board) = kept_board(&self.database_file, Version::of_database(open.file, open.db.writes()?)) {
+        if let Some(board) = kept_board(&self.database_file, Version::of_database(open.file, open.db.writes()?)).filter(|_| !even_if_kept) {
             let revision = board.values().filter_map(|item| item.rev).max().unwrap_or(0);
             return Ok(Some((board, revision)));
         }
-        let (board, revision) = open.db.working_set(&targets(&open.db)?)?;
+        let Some(targets) = targets(&open.db)? else {
+            drop(opened);
+            let board = self.get_shared()?;
+            let revision = board.values().filter_map(|item| item.rev).max().unwrap_or(0);
+            return Ok(Some((board, revision)));
+        };
+        let (board, revision) = open.db.working_set(&targets)?;
         Ok(Some((Arc::new(board), revision)))
     }
 
@@ -359,7 +367,7 @@ impl Storage {
         let mut opened = self.database.lock().unwrap_or_else(PoisonError::into_inner);
         self.open_database(&mut opened)?;
         let Some(open) = opened.as_ref() else { return Ok(None) };
-        if open.db.layout()? != database::LAYOUT {
+        if !open.db.queryable()? {
             return Ok(None);
         }
         if !even_if_kept && kept_board(&self.database_file, Version::of_database(open.file, open.db.writes()?)).is_some() {

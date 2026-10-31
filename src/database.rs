@@ -51,8 +51,8 @@ ALTER TABLE items ADD COLUMN rev INTEGER GENERATED ALWAYS AS (json_extract(body,
 CREATE INDEX items_uid ON items(uid);
 CREATE INDEX items_rev ON items(rev);
 CREATE TABLE refs (item INTEGER NOT NULL, path TEXT NOT NULL, target TEXT NOT NULL);
-CREATE INDEX refs_target ON refs(target);
-CREATE INDEX refs_item ON refs(item);
+CREATE INDEX refs_target ON refs(target, path, item);
+CREATE INDEX refs_item ON refs(item, path, target);
 CREATE TABLE words (word TEXT NOT NULL, item INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (word, item)) WITHOUT ROWID;
 CREATE INDEX words_item ON words(item);
 CREATE TABLE lengths (item INTEGER PRIMARY KEY, words INTEGER NOT NULL, place TEXT);
@@ -64,10 +64,18 @@ CREATE INDEX lengths_place ON lengths(place);
 /// which is what lets SQLite read the index for it.
 const GUARDED: &str = "json_extract(body, '$.cue') IS NOT NULL OR json_extract(body, '$.question.allow') IS NOT NULL";
 
-/// Lays out what layout 2 adds: `DERIVED`, and the guard's partial index.
+/// An item whose uid has not the shape `is_uid` reads, in SQL: references
+/// to it are not in refs, so a read by query could miss them. A board
+/// written by hand or grown by a script may hold one; ekko makes none.
+const ODD_UID: &str = "uid IS NOT NULL AND NOT (length(uid) BETWEEN 18 AND 33 AND substr(uid, 17, 1) = '-' \
+     AND substr(uid, 1, 16) NOT GLOB '*[^0-9a-f]*' AND substr(uid, 18) NOT GLOB '*[^0-9a-f]*')";
+
+/// Lays out what layout 2 adds: `DERIVED`, and the partial indexes on the
+/// items the guard reads and on those whose uid is odd.
 fn lay_derived(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(DERIVED)?;
     conn.execute_batch(&format!("CREATE INDEX items_guarded ON items(id) WHERE {GUARDED};"))?;
+    conn.execute_batch(&format!("CREATE INDEX items_odd_uid ON items(id) WHERE {ODD_UID};"))?;
     Ok(())
 }
 
@@ -399,18 +407,35 @@ impl Database {
         Ok(SearchCounts { documents: documents as usize, total: total as usize, counted })
     }
 
+    /// Whether a read may find items by query here (task 2234): the layout
+    /// is this one, and no item has an odd uid (`ODD_UID`), which refs
+    /// would not know as one.
+    pub fn queryable(&self) -> Result<bool, StorageError> {
+        if self.layout()? != LAYOUT {
+            return Ok(false);
+        }
+        // INDEXED BY: left to itself, SQLite walks every uid in items_uid.
+        let odd: bool = self.conn.query_row(&format!("SELECT EXISTS (SELECT 1 FROM items INDEXED BY items_odd_uid WHERE {ODD_UID})"), [], |row| row.get(0))?;
+        Ok(!odd)
+    }
+
     /// The items holding a cue or a question's allowance, by the partial
     /// index on them: all the guard's index can be made of.
     pub fn guarded(&self) -> Result<ItemMap, StorageError> {
         let mut rows = Vec::new();
         {
-            let mut statement = self.conn.prepare_cached(&format!("SELECT id, body FROM items WHERE {GUARDED} ORDER BY id"))?;
+            let mut statement = self.conn.prepare_cached(&format!("SELECT id, body FROM items INDEXED BY items_guarded WHERE {GUARDED} ORDER BY id"))?;
             let mut found = statement.query([])?;
             while let Some(row) = found.next()? {
                 rows.push((row.get::<_, u32>(0)?, row.get::<_, String>(1)?));
             }
         }
         parse(rows)
+    }
+
+    /// How many items the board holds.
+    pub fn items(&self) -> Result<usize, StorageError> {
+        Ok(self.conn.query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))? as usize)
     }
 
     /// The items whose revision is past `since` and no later than `cursor`,
@@ -793,6 +818,52 @@ mod tests {
         assert!(is_uid(&crate::item::new_uid()), "the shape is the one ekko gives a uid");
     }
 
+    /// SQL's `ODD_UID` and Rust's `is_uid` tell the same uids apart, for
+    /// shapes on either side of each bound; and a board holding one odd uid
+    /// is not read by query until it is gone.
+    #[test]
+    fn a_board_with_an_odd_uid_is_not_read_by_query() {
+        let dir = crate::paths::test_dir("ekko-database-odd-uid");
+        fs::create_dir_all(&dir).unwrap();
+        let mut db = Database::create(&dir.join(FILE)).unwrap();
+        let shapes = [
+            "18e398963d9b9a63-308282",
+            "18e398963d9b9a63-1",
+            "18e398963d9b9a63-0123456789abcdef",
+            "18e398963d9b9a63-0123456789abcdef0",
+            "18e398963d9b9a63-",
+            "18e398963d9b9a6-308282",
+            "18e398963d9b9a633-308282",
+            "18E398963D9B9A63-308282",
+            "18e398963d9b9a63-308282-x1",
+            "18cfe210cac4b1a0-108811-x1",
+            "50daee67-47ea-4675-8a9d-0e88400f18a5",
+            "u1",
+        ];
+        let items: Vec<Item> = shapes
+            .iter()
+            .enumerate()
+            .map(|(at, uid)| {
+                let mut item = Item::new_task(at as u32 + 1, format!("item {at}"), vec!["@a".into()], 1);
+                item.uid = Some(uid.to_string());
+                item
+            })
+            .collect();
+        write(&mut db, 1, items.iter().map(|item| Change { id: item.id, after: Some(item) }).collect());
+        let odd: Vec<u32> = {
+            let mut statement = db.conn.prepare(&format!("SELECT id FROM items WHERE {ODD_UID} ORDER BY id")).unwrap();
+            statement.query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        let expected: Vec<u32> = items.iter().filter(|item| !is_uid(item.uid.as_deref().unwrap())).map(|item| item.id).collect();
+        assert_eq!(odd, expected);
+        assert!(!db.queryable().unwrap(), "a board holding odd uids was read by query");
+
+        write(&mut db, 2, expected.iter().map(|id| Change { id: *id, after: None }).collect());
+        assert!(db.queryable().unwrap(), "a board of ekko's uids was not read by query");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// The derived rows, one line each, in order.
     fn derived(conn: &Connection) -> Vec<String> {
         let mut rows = Vec::new();
@@ -841,7 +912,7 @@ mod tests {
 
         write(&mut db, 1, vec![Change { id: 1, after: Some(&first) }, Change { id: 2, after: Some(&second) }]);
         let rows = derived(&db.conn);
-        assert!(rows.iter().any(|row| row.starts_with("ref 1 blockedBy ")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.starts_with("ref 1 ") && row.contains(" blockedBy ")), "{rows:?}");
         assert!(rows.contains(&"word parser 2 1".to_string()), "{rows:?}");
         assert_eq!(rows, rebuilt(&db.conn));
 

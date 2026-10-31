@@ -2433,6 +2433,7 @@ fn changed_set<'a>(
     since: i64,
     cursor: i64,
     journal: impl Iterator<Item = &'a serde_json::Value>,
+    even_if_kept: bool,
 ) -> Result<Arc<ItemMap>, EkkoError> {
     if since >= CLOCK_CURSOR {
         return Ok(ekko.storage.get_shared()?);
@@ -2446,10 +2447,16 @@ fn changed_set<'a>(
             named.extend(item["id"].as_u64().map(|id| id.to_string()));
         }
     }
-    let read = ekko.storage.working_set_of(|db| {
-        let mut targets: Vec<String> = db.moved_between(since, cursor)?.into_iter().map(|id| id.to_string()).collect();
+    let read = ekko.storage.working_set_of(even_if_kept, |db| {
+        let moved = db.moved_between(since, cursor)?;
+        // Past an eighth of the board, the working set is most of it, and
+        // the whole board, parsed at once, is the cheaper read.
+        if moved.len() * 8 > db.items()? {
+            return Ok(None);
+        }
+        let mut targets: Vec<String> = moved.into_iter().map(|id| id.to_string()).collect();
         targets.append(&mut named);
-        Ok(targets)
+        Ok(Some(targets))
     })?;
     match read {
         Some((all, _)) => Ok(all),
@@ -2458,6 +2465,13 @@ fn changed_set<'a>(
 }
 
 pub fn changes(ekko: &Ekko, since: i64) -> Result<Changes, EkkoError> {
+    changes_read(ekko, since, false)
+}
+
+/// `changes`, from the items the board's database names for it even where
+/// this process keeps the whole board, when `even_if_kept`: for the tests
+/// that hold one read to the other.
+fn changes_read(ekko: &Ekko, since: i64, even_if_kept: bool) -> Result<Changes, EkkoError> {
     // The revision first, then the board and the journal: a writer publishes
     // the revision last, so every write up to `cursor` is already on disk.
     // A write past it shows in the board but waits for the next call, so no
@@ -2471,7 +2485,7 @@ pub fn changes(ekko: &Ekko, since: i64) -> Result<Changes, EkkoError> {
             entry["rev"].as_i64().is_some_and(|rev| rev > since && rev <= cursor)
         }
     };
-    let all = changed_set(ekko, since, cursor, journal.iter().filter(|entry| after(entry)))?;
+    let all = changed_set(ekko, since, cursor, journal.iter().filter(|entry| after(entry)), even_if_kept)?;
     let phases = ekko.storage.get_phases()?;
     let reader = Reader::shared(&all, &phases).seen_by(ekko);
     let moved = |item: &&Item| {
@@ -5437,6 +5451,40 @@ mod tests {
         assert!(current.contains("\nReplaces, an earlier handoff\n   2. [handoff, replaced] stopped"), "{current}");
         let found = search(&ekko, Some("parser"), &[], 20).unwrap().text();
         assert!(found.contains("   2. [handoff, replaced by 3] "), "{found}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What changes reads from the items the board's database names for it
+    /// (task 2234) is what it reads from the whole board, from every cursor
+    /// of a history that set work free, left work waiting and cleared done
+    /// work away -- among it a task set free by a blocker since cleared,
+    /// which no item that moved names any more: only the journal does.
+    #[test]
+    fn changes_from_their_working_set_are_the_ones_from_the_whole_board() {
+        let (ekko, dir) = board("working-set-changes");
+        for text in ["blocker", "waits", "done and cleared", "second blocker", "set free and left alone"] {
+            ekko.create_task(&words(&[text])).unwrap();
+        }
+        // Enough items that the last writes, one item or two each, stay
+        // under an eighth of the board and are read by working set.
+        for _ in 0..20 {
+            ekko.create_task(&words(&["filler"])).unwrap();
+        }
+        ekko.set_blocked_by(&words(&["@2", "1"])).unwrap();
+        ekko.set_blocked_by(&words(&["@5", "1"])).unwrap();
+        ekko.set_state(&words(&["@3", "done"]), false).unwrap();
+        ekko.set_state(&words(&["@1", "done"]), false).unwrap();
+        ekko.set_blocked_by(&words(&["@2", "4"])).unwrap();
+        ekko.clear().unwrap();
+        write(&ekko, &[serde_json::json!({"op": "create", "kind": "note", "text": "why it waits", "attached_to": 2})]);
+        let last = prime(&ekko, "default board").unwrap().cursor;
+        for since in 0..=last {
+            let whole = changes(&ekko, since).unwrap();
+            let read = changes_read(&ekko, since, true).unwrap();
+            assert_eq!(format!("{read:?}"), format!("{whole:?}"), "since {since}");
+            assert_eq!(read.text(), whole.text(), "since {since}");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
