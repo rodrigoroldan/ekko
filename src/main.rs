@@ -1409,12 +1409,19 @@ fn run_clipboard_daemon() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    use arboard::SetExtLinux as _;
-
     let Ok(mut clipboard) = arboard::Clipboard::new() else {
         return ExitCode::FAILURE;
     };
-    match clipboard.set().wait().text(text) {
+    // macOS keeps the pasteboard after the writer exits: no wait needed, and
+    // arboard's SetExtLinux does not exist there.
+    #[cfg(target_os = "macos")]
+    let set = clipboard.set_text(text);
+    #[cfg(not(target_os = "macos"))]
+    let set = {
+        use arboard::SetExtLinux as _;
+        clipboard.set().wait().text(text)
+    };
+    match set {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
