@@ -459,6 +459,12 @@ pub struct Cli {
     /// two weeks of changes its database keeps.
     #[arg(long, value_name = "REV", requires = "export")]
     pub at: Option<u64>,
+    /// Leaves out what the docs leave out: the items on `@private` and the
+    /// notes on a task there, from the board views, `--since`, `--find`,
+    /// `--list` and `--export`, so that a script reading `--json` need not
+    /// guess which items are the user's alone.
+    #[arg(long)]
+    pub public: bool,
     /// Writes the board in FILE, JSON as --export prints it, in place of this
     /// one, in one write: with --export --at, how a board goes back to a
     /// revision (task 2233). `-` reads it from stdin.
