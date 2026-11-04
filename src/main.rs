@@ -83,6 +83,7 @@ const HELP: &str = r#"
       --probe             With --doctor: write the board again, then wait for each session on it to hear it
       --edit, -e          Edit item description
       --export            Print the board as JSON, as storage.json held it
+      --public            Leave out items on @private and the notes on a task there
       --at <REV>          With --export: the board as it stood at that revision
       --find, -f          Search for items
       --force             Override the blocked-by rule or a running session's hold
@@ -377,7 +378,9 @@ fn main() -> ExitCode {
         return wake::hook(&ekko, &read_hook_input(), &home_dir, &board_label);
     }
 
-    match dispatch(&cli, &ekko, location.project.as_ref(), &home_dir, &cwd, &board_label) {
+    match dispatch(&cli, &ekko, location.project.as_ref(), &home_dir, &cwd, &board_label)
+        .and_then(|outcomes| if cli.public { leave_private(&ekko, outcomes) } else { Ok(outcomes) })
+    {
         Ok(outcomes) => {
             if json_mode {
                 for outcome in &outcomes {
@@ -1188,6 +1191,30 @@ fn described(input: &[String]) -> Result<Vec<String>, EkkoError> {
 /// there. `--timeline`/`--list`/the default (no flag) view each produce
 /// *two* outcomes -- the view, then the stats line -- matching the two
 /// separate render calls index.js made for those three cases.
+/// `--public`: what the board views, `--since`, `--find`, `--list` and
+/// `--export` show, less the items on `@private` and the notes on a task there.
+fn leave_private(ekko: &Ekko, outcomes: Vec<Outcome>) -> Result<Vec<Outcome>, EkkoError> {
+    let board = ekko.storage.get_shared()?;
+    let kept = |item: &item::Item| !item.is_left_out(&board);
+    Ok(outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            Outcome::Board(groups) => Outcome::Board(without(groups, &kept)),
+            Outcome::Find(groups) => Outcome::Find(without(groups, &kept)),
+            Outcome::List(groups) => Outcome::List(without(groups, &kept)),
+            Outcome::Export(mut items) => {
+                items.retain(|_, item| kept(item));
+                Outcome::Export(items)
+            }
+            other => other,
+        })
+        .collect())
+}
+
+fn without(groups: Vec<(String, Vec<item::Item>)>, kept: &impl Fn(&item::Item) -> bool) -> Vec<(String, Vec<item::Item>)> {
+    groups.into_iter().map(|(name, mut items)| { items.retain(kept); (name, items) }).filter(|(_, items)| !items.is_empty()).collect()
+}
+
 fn dispatch(
     cli: &cli::Cli,
     ekko: &Ekko,

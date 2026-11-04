@@ -1196,6 +1196,30 @@ impl How {
     }
 }
 
+/// The board that marks an item as the user's alone: `ekko docs` leaves it
+/// out, and so does `--public`. Compared without regard to case.
+pub const PRIVATE: &str = "@private";
+
+impl Item {
+    /// Whether the item itself is on `@private`.
+    pub fn is_private(&self) -> bool {
+        self.boards.iter().any(|name| name.eq_ignore_ascii_case(PRIVATE))
+    }
+
+    /// Whether `--public` leaves the item out of `board`: it is on `@private`,
+    /// or it is a note on a task that is.
+    pub fn is_left_out(&self, board: &std::collections::BTreeMap<u32, Item>) -> bool {
+        if self.is_private() {
+            return true;
+        }
+        if self.is_task {
+            return false;
+        }
+        let Some(uid) = self.attached_to.as_deref() else { return false };
+        board.values().any(|task| task.is_task && task.uid.as_deref() == Some(uid) && task.is_private())
+    }
+}
+
 /// The kinds of lasting knowledge a note can hold; see `Item::knowledge`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Knowledge {
