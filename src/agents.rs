@@ -4184,6 +4184,7 @@ mod tests {
                 config_dir: None,
                 board: None,
                 transcript: None,
+                entrypoint: None,
                 conversation: conversation.to_string(),
                 earlier: vec!["before".to_string()],
                 since: 0,

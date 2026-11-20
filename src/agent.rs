@@ -2848,6 +2848,12 @@ pub struct SessionView {
     pub since: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume: Option<String>,
+    /// Where it was started from: `cli`, `claude-desktop`, `sdk-cli`...
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    /// Where Claude Code writes its conversation, when the hook was told.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<PathBuf>,
     pub holding: Vec<SessionItem>,
     pub finished: Vec<SessionItem>,
     pub asking: Vec<SessionItem>,
@@ -2870,6 +2876,8 @@ pub fn sessions(ekko: &Ekko, board: &str) -> Result<Sessions, EkkoError> {
         running: running.process().alive(),
         since: Some(running.since),
         resume: Some(running.resume()),
+        entrypoint: running.entrypoint.clone(),
+        transcript: running.transcript.clone(),
         holding: Vec::new(),
         finished: Vec::new(),
         asking: Vec::new(),
@@ -2900,6 +2908,8 @@ pub fn sessions(ekko: &Ekko, board: &str) -> Result<Sessions, EkkoError> {
             running: holder.alive(),
             since: None,
             resume: holder.conversation.as_ref().map(|conversation| format!("claude --resume {conversation}")),
+            entrypoint: None,
+            transcript: None,
             holding: Vec::new(),
             finished: Vec::new(),
             asking: Vec::new(),
@@ -6442,6 +6452,27 @@ mod tests {
     /// with what it holds, finished today and asked, and how to resume it.
     /// The user's ask of 2026-09-22 (task 370): every session shows the same
     /// board, and nothing said which work was whose.
+    /// `--sessions --json` says where each session was started from and where
+    /// its transcript is, which a script that picks a conversation up needs.
+    #[test]
+    fn sessions_json_names_the_entrypoint_and_the_transcript() {
+        let (me, _, _) = crate::holder::test_sessions();
+        let (_, dir) = board("sessions-json");
+        let registry = crate::holder::Registry::at(dir.join("processes"));
+        let ekko = Ekko::new(Storage::new(&dir).unwrap()).acting_as(me.with_registry(registry));
+        let transcript = dir.join("c-json.jsonl");
+        let event = SessionEvent { source: "startup".to_string(), session_id: Some("c-json".to_string()), transcript: Some(transcript.clone()) };
+        session_start(&ekko, "default board", &event, &dir.join("sessions"), || None, || None).unwrap();
+
+        let said = serde_json::to_value(sessions(&ekko, "default board").unwrap()).unwrap();
+        let mine = &said["sessions"][0];
+        assert_eq!(mine["transcript"], transcript.to_string_lossy().as_ref());
+        match std::env::var("CLAUDE_CODE_ENTRYPOINT").ok().filter(|kind| !kind.is_empty()) {
+            Some(kind) => assert_eq!(mine["entrypoint"], kind),
+            None => assert!(mine.get("entrypoint").is_none(), "{mine}"),
+        }
+    }
+
     #[test]
     fn sessions_shows_each_session_on_the_board_and_its_work() {
         let (me, other, gone) = crate::holder::test_sessions();
