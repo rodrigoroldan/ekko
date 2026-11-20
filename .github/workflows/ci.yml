@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Lets the fork rerun CI by hand: GitHub did not register this workflow
+  # when the history arrived in one bulk push.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

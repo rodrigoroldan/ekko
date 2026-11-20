@@ -576,6 +576,7 @@ fn gone(state: char) -> bool {
 /// `pid`'s state, parent and start, from /proc/<pid>/stat. The name in
 /// field 2 can hold spaces and parentheses, so the fields are counted from
 /// its end: the state is field 3, the parent field 4 and the start field 22.
+#[cfg(not(target_os = "macos"))]
 fn status(pid: u32) -> Option<(char, u32, u64)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
@@ -586,8 +587,61 @@ fn status(pid: u32) -> Option<(char, u32, u64)> {
     Some((state, parent, start))
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn boot() -> Option<String> {
     Some(fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?.trim().to_string())
+}
+
+/// macOS has no /proc: the same three fields from libproc's BSD info, the
+/// start in microseconds since the epoch, which no reused pid repeats.
+#[cfg(target_os = "macos")]
+fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let got = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
+    (got == size).then_some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn status(pid: u32) -> Option<(char, u32, u64)> {
+    let info = bsdinfo(pid)?;
+    let state = if info.pbi_status == libc::SZOMB { 'Z' } else { 'R' };
+    Some((state, info.pbi_ppid, info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec))
+}
+
+/// A process's short name, as /proc/<pid>/comm gives it on Linux.
+#[cfg(target_os = "macos")]
+pub(crate) fn comm(pid: u32) -> Option<String> {
+    let info = bsdinfo(pid)?;
+    let bytes: Vec<u8> = info.pbi_comm.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn comm(pid: u32) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/comm")).ok()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn boot() -> Option<String> {
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    let name = c"kern.bootsessionuuid";
+    let ok = unsafe { libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
+    ok.then(|| String::from_utf8_lossy(&buf[..len]).trim_end_matches('\0').trim().to_string()).filter(|b| !b.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn tty(pid: u32) -> Option<String> {
+    let dev = bsdinfo(pid)?.e_tdev;
+    if dev == u32::MAX || dev == 0 {
+        return None;
+    }
+    let name = unsafe { libc::devname(dev as libc::dev_t, libc::S_IFCHR) };
+    if name.is_null() {
+        return None;
+    }
+    Some(unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned())
 }
 
 /// The profile Claude Code runs with, named after its config directory.
@@ -601,6 +655,7 @@ pub(crate) fn profile() -> Option<String> {
 }
 
 /// The terminal `pid` reads from, as `pts/1` or `tty2`.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn tty(pid: u32) -> Option<String> {
     let path = fs::read_link(format!("/proc/{pid}/fd/0")).ok()?;
     let name = path.to_str()?.strip_prefix("/dev/")?;
@@ -618,7 +673,7 @@ fn claude_ancestor() -> Option<u32> {
 /// request (task 1103).
 pub(crate) fn claude_among(mut pid: u32) -> Option<u32> {
     for _ in 0..16 {
-        let name = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        let name = comm(pid)?;
         if name.trim().trim_start_matches('.').starts_with("claude") {
             return Some(pid);
         }
@@ -652,6 +707,19 @@ mod tests {
         assert!(me.alive());
         assert!(!Process { start: me.start + 1, ..me.clone() }.alive(), "another process that got the pid");
         assert!(!Process { boot: "another boot".into(), ..me.clone() }.alive());
+    }
+
+    /// Without /proc, libproc and sysctl tell what /proc does: this process's
+    /// parent, start, name and boot, none of them empty.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn libproc_reads_this_process_as_proc_does() {
+        let (state, parent, start) = status(std::process::id()).expect("libproc reads this process");
+        assert_eq!((state, parent), ('R', std::os::unix::process::parent_id()));
+        assert!(start > 0);
+        assert!(boot().is_some_and(|boot| !boot.is_empty()));
+        assert!(comm(std::process::id()).is_some_and(|name| !name.trim().is_empty()));
+        assert_eq!(status(u32::MAX - 1), None, "a pid no process has");
     }
 
     /// A process that exited and that its parent has not reaped is a zombie:
