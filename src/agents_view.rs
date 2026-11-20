@@ -829,6 +829,7 @@ mod tests {
             config_dir: None,
             board: board.cloned(),
             transcript: None,
+            entrypoint: None,
             conversation: conversation.to_string(),
             earlier: Vec::new(),
             since: 0,
