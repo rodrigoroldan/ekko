@@ -337,6 +337,16 @@ None of this is documented by Claude Code: the file format and the rules come fr
 
 **The doctor in the prime.** The prime adds a line under Needs attention naming the sessions on its own board that need a restart (task 1287), as `sessions on this board to restart: this session (it runs ekko-0.39.1, replaced since); default on pts/1 · 4461f145 (its FileChanged hook missed the board's last write); +1 more -- ekko --doctor says why`. It runs the checks that read no transcript -- Old binary, Hooks loaded and Wake heard -- and names each failing session once, by its first fail, the session the prime is for first, as this session, two named and the rest counted. A session's board is the one its SessionStart hook recorded, or, for a session no hook recorded, which gets no prime of its own, the one its ekko finds from its folder, `EKKO_DIR` and `EKKO_PROJECT`; two paths name one board when they reach one folder, as a project mounted at two paths does. Only the SessionStart hook's prime runs the checks, never the `prime` tool. They added 6.9 ms to the hook's prime, 49.6 ms to 56.3 ms by the medians, over 453 processes (200 runs of each build, interleaved, a release build, 2026-10-09); reading every process whole, before the name was read first, had added 26 ms. With a stand-in for Claude Code running ekko's server in this project's folder, the prime of the project's board, of about 8,600 characters, gave no line while the server was under 5 s old, named it once it was older, and named the binary once the one on its PATH was swapped; the prime of another project's board did not name it.
 
+### Which Claude Code surfaces it works in
+
+The plugin's hooks and the MCP server belong to the project, not to one way of starting Claude Code, so they load wherever Claude Code reads the project's `.claude/settings.json` (or the plugin is enabled for the user): the terminal CLI, the Code tab of the Claude desktop app, and a session started from the phone through Remote Control. Each surface records itself in `~/.claude/sessions/<pid>.json` with an `entrypoint` -- `cli`, `claude-desktop` or `sdk-cli` -- and a session on any of them registers with ekko at SessionStart like any other.
+
+What differs is how a session shows up:
+
+- A session in a terminal has a tty, so `ekko --sessions` and a task's holder read `default on ttys001 · 4461f145`. One started from the desktop app has none and reads `default, pid 61234 · 4461f145`.
+- A session only loads the hooks if its folder (or the worktree it runs in) has the project's settings. A desktop or Remote Control session opened in a folder without them, or in a worktree of a branch from before they were added, is not seen by ekko; neither is one that was already open when the plugin was installed, until it restarts.
+- `ekko --doctor` tells which of the sessions it can see run an old binary or miss a hook.
+
 ### Reading the board as an agent
 
 The same views are flags, for scripts, for the hook, and for a person curious what an agent sees:
