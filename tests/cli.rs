@@ -5345,3 +5345,37 @@ fn a_born_session_is_refused_a_write_outside_its_worktree_and_branch_and_its_orc
     let notebook = serde_json::json!({"notebook_path": app.join("a.ipynb"), "new_source": "x"});
     assert!(hook("NotebookEdit", notebook, true).contains("\"deny\""), "NotebookEdit in the project's checkout");
 }
+
+/// `--public` leaves out what the docs leave out -- an item on `@private`,
+/// and a note on a task there -- from the views a script reads with `--json`.
+#[test]
+fn public_leaves_out_private_items_and_the_notes_on_them() {
+    let dir = temp_ekko_dir();
+    let run = |args: &[&str]| {
+        let output = common::ekko().args(["--ekko-dir", dir.to_str().unwrap()]).args(args).output().expect("failed to run ekko");
+        assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    run(&["--task", "@private", "the client's host"]);
+    run(&["--task", "ship the release"]);
+    run(&["--note", "root password is in the vault"]);
+    run(&["--attached-to", "@3", "1"]);
+    run(&["--note", "release goes out on friday"]);
+    run(&["--attached-to", "@4", "2"]);
+
+    for view in [&["--json"][..], &["--json", "--since", "0"], &["--json", "--export"]] {
+        let all = run(view);
+        for text in ["the client's host", "root password", "ship the release", "friday"] {
+            assert!(all.contains(text), "{view:?} without --public lacks {text:?}");
+        }
+        let mut public = view.to_vec();
+        public.push("--public");
+        let public = run(&public);
+        for text in ["the client's host", "root password"] {
+            assert!(!public.contains(text), "{view:?} --public still holds {text:?}:\n{public}");
+        }
+        for text in ["ship the release", "friday"] {
+            assert!(public.contains(text), "{view:?} --public lost {text:?}:\n{public}");
+        }
+    }
+}

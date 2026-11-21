@@ -34,7 +34,7 @@ const TITLE: usize = 120;
 
 /// The board that keeps an item out of the docs, the way `draft: true` keeps
 /// a page out of a site Quartz builds (note 1006), in any case.
-const PRIVATE: &str = "@private";
+const PRIVATE: &str = crate::item::PRIVATE;
 
 /// What a run wrote, for the reply.
 #[derive(Debug, Clone, Serialize)]
