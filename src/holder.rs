@@ -119,6 +119,7 @@ impl Actor {
             config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok().filter(|dir| !dir.is_empty()),
             board: Some(board.to_path_buf()),
             transcript: transcript.map(Path::to_path_buf),
+            entrypoint: std::env::var("CLAUDE_CODE_ENTRYPOINT").ok().filter(|kind| !kind.is_empty()),
             conversation: conversation.to_string(),
             earlier: Vec::new(),
             since: chrono::Local::now().timestamp_millis(),
@@ -341,6 +342,10 @@ pub struct Running {
     /// to this one (`continued_in`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<PathBuf>,
+    /// Where Claude Code was started from (`cli`, `claude-desktop`,
+    /// `sdk-cli`...), as it told the hook in `CLAUDE_CODE_ENTRYPOINT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
     /// The conversation it runs now, or ran last.
     pub conversation: String,
     /// The ones it ran before, oldest first: each /clear adds one.
@@ -738,7 +743,7 @@ mod tests {
             let (pid, start, boot) = (process.pid, process.start, process.boot.clone());
             let (profile, tty, config_dir, board, transcript) = (None, None, None, None, None);
             let conversation = conversation.to_string();
-            registry.record(Running { pid, start, boot, profile, tty, config_dir, board, transcript, conversation: conversation.clone(), earlier: Vec::new(), since: 0 }).unwrap();
+            registry.record(Running { pid, start, boot, profile, tty, config_dir, board, transcript, entrypoint: None, conversation: conversation.clone(), earlier: Vec::new(), since: 0 }).unwrap();
             [
                 process.alive(),
                 actor.holder(1).alive(),
@@ -779,6 +784,7 @@ mod tests {
                 config_dir: None,
                 board: None,
                 transcript: None,
+                entrypoint: None,
                 conversation: conversation.to_string(),
                 earlier: Vec::new(),
                 since: 0,
